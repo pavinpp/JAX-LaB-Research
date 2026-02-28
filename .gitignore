@@ -165,3 +165,6 @@ dmypy.json
 
 # Checkpoints (default dir for JAX-LaB)
 checkpoints/*
+
+# Large local data files
+digital_rock_project/tiff_stack/empty_chip.tif
