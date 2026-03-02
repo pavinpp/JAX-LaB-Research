@@ -23,18 +23,9 @@ def compute_virtual_density(rho: jnp.ndarray, solid_mask: jnp.ndarray, fluid_mas
     """
     pi_over_2 = jnp.pi / 2.0
     
-    # Align mask dimensions with rho to avoid accidental broadcasting
-    # e.g. (nx, ny, nz) with (nx, ny, nz, 1) producing (nx, ny, nz, nz)
-    expand_dims = rho.ndim - solid_mask.ndim
-    solid_mask_aligned = solid_mask
-    fluid_mask_aligned = fluid_mask
-    for _ in range(expand_dims):
-        solid_mask_aligned = solid_mask_aligned[..., None]
-        fluid_mask_aligned = fluid_mask_aligned[..., None]
-
     # Calculate global average fluid density
-    fluid_sum = jnp.sum(rho * fluid_mask_aligned)
-    fluid_count = jnp.maximum(jnp.sum(fluid_mask_aligned), 1.0)
+    fluid_sum = jnp.sum(rho * fluid_mask)
+    fluid_count = jnp.maximum(jnp.sum(fluid_mask), 1.0)
     rho_ave = fluid_sum / fluid_count
     
     # Determine thermodynamic wetting sign based on contact angle
@@ -44,6 +35,6 @@ def compute_virtual_density(rho: jnp.ndarray, solid_mask: jnp.ndarray, fluid_mas
     rho_s = (phi * rho) + ((1.0 - phi) * rho_ave) + (sign * delta_rho)
     
     # Apply the virtual density exclusively to the solid nodes
-    rho_new = jnp.where(solid_mask_aligned, rho_s, rho)
+    rho_new = jnp.where(solid_mask, rho_s, rho)
     
     return rho_new

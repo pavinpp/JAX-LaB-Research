@@ -251,13 +251,19 @@ def run_simulation():
     # ---------------------------------------------------------
     T_hot, T_cold, C_inlet = 75.0, 25.0, 1.0
     
-    rho1 = jnp.zeros(mask.shape, dtype=jnp.float64) 
-    rho2 = jnp.ones(mask.shape, dtype=jnp.float64) * 0.5 
-    u_init = jnp.zeros(mask.shape + (3,), dtype=jnp.float64)
+    # 1. เพิ่ม Channel Dimension (1) ให้กับความหนาแน่น เพื่อการ Broadcasting ใน LBM
+    rho1 = jnp.zeros(mask.shape + (1,), dtype=jnp.float64) 
+    rho2 = jnp.ones(mask.shape + (1,), dtype=jnp.float64) * 0.5 
+    
+    # 2. ในระบบ Multiphase ต้องเตรียม Velocity แยกราย Component (PyTree)
+    u1_init = jnp.zeros(mask.shape + (3,), dtype=jnp.float64)
+    u2_init = jnp.zeros(mask.shape + (3,), dtype=jnp.float64)
     
     rho_tree_init = [rho1, rho2]
-    # แก้ไข 4: ให้ sim.equilibrium รับ PyTree จัดการ jax_map ให้เบ็ดเสร็จภายใน
-    f_tree = sim.equilibrium(rho_tree_init, u_init)
+    u_tree_init = [u1_init, u2_init]
+    
+    # 3. เรียก equilibrium โดยส่ง PyTree ทั้งคู่เข้าไป
+    f_tree = sim.equilibrium(rho_tree_init, u_tree_init)
     
     T_field = jnp.ones(mask.shape, dtype=jnp.float64) * T_cold
     C_field = jnp.zeros(mask.shape, dtype=jnp.float64)

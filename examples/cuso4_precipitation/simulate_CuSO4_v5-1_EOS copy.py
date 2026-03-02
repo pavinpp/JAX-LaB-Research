@@ -19,12 +19,11 @@ from src.lattice import LatticeD3Q19
 from src.physics.crystallization import compute_heterogeneous_precipitation, calculate_equilibrium_concentration
 from src.physics.porous_media import compute_permeability, compute_supersaturation
 from src.physics.wettability import compute_virtual_density
-from src.physics.stability_utils import stable_pseudopotential_calculation
 
 # -------------------------------------------------------------------
 # [JAX-LaB Core Imports]
 # -------------------------------------------------------------------
-from src.multiphase import MultiphaseMRT
+from src.multiphase import Multiphase
 from src.eos import Peng_Robinson
 
 def parse_ui_args():
@@ -60,52 +59,46 @@ def calculate_tau_f(T_celsius, tau_ref=1.0):
 # =========================================================================
 # คลาสจำลอง Reactive MCMP Simulator (สืบทอดจาก Multiphase Core)
 # =========================================================================
-class ReactiveMCMP_Simulator(MultiphaseMRT):
-    def __init__(self, mask, **kwargs):
+class ReactiveMCMP_Simulator(Multiphase):
+    def __init__(self, mask, kappa_mrt=0.15, **kwargs):
         super().__init__(**kwargs)
         self.solid_mask = ~mask
         self.fluid_mask = mask
+        self.kappa_mrt = kappa_mrt
         
     def macroscopic_velocity(self, fin_tree, rho_tree):
         # 1. แทรก Wettability: ปรับความหนาแน่นจำลองที่ขอบของแข็ง (มุม 45 องศา)
         rho_tree_wet = jax_map(
-            lambda rho: compute_virtual_density(rho, self.solid_mask, self.fluid_mask, theta=jnp.pi/4, phi=1.1, delta_rho=0.05),
+            lambda rho: compute_virtual_density(rho, self.solid_mask, self.fluid_mask, theta=jnp.pi/4, phi=0.8, delta_rho=0.05), 
             rho_tree
         )
-
-        # 2. ให้ JAX-LaB คำนวณความเร็วต่อ component ด้วย PR-EOS และ Shan-Chen Forces
-        rho_tree_safe = jax_map(lambda rho: jnp.maximum(rho, 1e-8), rho_tree_wet)
-        u_tree = super().macroscopic_velocity(fin_tree, rho_tree_safe)
-
-        # 3. คำนวณความเร็วรวม (mass-averaged) เพื่อให้เป็น single array
-        u_eq = self.compute_total_velocity(rho_tree_safe, u_tree)
-
-        # 4. [STABILITY] จํากัดความเร็ว (Clipping) ป้องกันโค้ดระเบิดช่วงแรก
+        
+        # 2. ให้ JAX-LaB คำนวณความเร็วสมดุลด้วย PR-EOS และ Shan-Chen Forces
+        u_eq = super().macroscopic_velocity(fin_tree, rho_tree_wet)
+        
+        # 3. [STABILITY] จํากัดความเร็ว (Clipping) ป้องกันโค้ดระเบิดช่วงแรก
         u_eq = jnp.clip(u_eq, -0.1, 0.1)
         return u_eq
 
-    def collision(self, fin_tree):
-        fin_tree = jax_map(lambda f: self.precisionPolicy.cast_to_compute(f), fin_tree)
-        rho_tree, u_tree = self.update_macroscopic(fin_tree)
-        rho_tree = jax_map(lambda rho: jnp.maximum(rho, 1e-8), rho_tree)
-        u_tree = jax_map(lambda u: jnp.nan_to_num(jnp.clip(u, -0.2, 0.2), nan=0.0, posinf=0.2, neginf=-0.2), u_tree)
-
-        m_tree = jax_map(lambda f, M: jnp.dot(f, M), fin_tree, self.M)
-        feq_tree = self.equilibrium(rho_tree, u_tree, cast_output=False)
-        meq_tree = jax_map(lambda feq, M: jnp.dot(feq, M), feq_tree, self.M)
-
-        psi_tree, _ = self.compute_potential(rho_tree)
-        C_tree = self.adjust_surface_tension(psi_tree)
-        mout_tree = jax_map(
-            lambda m, meq, S: m - jnp.dot(m - meq, S),
-            m_tree,
-            meq_tree,
-            self.S,
+    def collision(self, fin_tree, T_field):
+        # 1. ให้ JAX-LaB ทำการชนแบบ MRT / Cascaded ให้เสร็จสมบูรณ์
+        fout_tree = super().collision(fin_tree)
+        
+        # 2. คํานวณความหนืดเฉพาะจุดจากอุณหภูมิ
+        tau_f_local = calculate_tau_f(T_field, tau_ref=1.0)
+        omega_f_local = 1.0 / tau_f_local
+        
+        # 3. ดึงความหนาแน่นและความเร็วมาคำนวณสมดุล (f_eq) เพื่อใช้ในเทอม Source
+        rho_tree, _ = self.update_macroscopic(fin_tree)
+        u_eq = self.macroscopic_velocity(fin_tree, rho_tree)
+        feq_tree = jax_map(lambda rho: self.compute_equilibrium(rho, u_eq), rho_tree)
+        
+        # 4. บวกเทอม Surface Tension (kappa) ทับลงไปบนผลลัพธ์ของคลาสแม่
+        fout_tree_modified = jax_map(
+            lambda fout, f, feq: fout + self.kappa_mrt * (feq - f) * (1.0 - 0.5 * omega_f_local[..., None]),
+            fout_tree, fin_tree, feq_tree
         )
-        mout_tree = self.apply_force(mout_tree, meq_tree, rho_tree, u_tree)
-        fout_tree = jax_map(lambda m, Minv, C: jnp.dot(m + C, Minv), mout_tree, self.M_inv, C_tree)
-        fout_tree = jax_map(lambda fout: jnp.nan_to_num(fout, nan=0.0, posinf=1e6, neginf=-1e6), fout_tree)
-        return jax_map(lambda fout: self.precisionPolicy.cast_to_output(fout), fout_tree)
+        return fout_tree_modified
 
 # =========================================================================
 # ฟังก์ชันคำนวณ LBM หลัก
@@ -133,7 +126,7 @@ def run_simulation():
     circular_mask_np = r_sq <= radius**2
     circular_mask = jnp.array(circular_mask_np) 
     
-    lattice = LatticeD3Q19("f64/f64")
+    lattice = LatticeD3Q19()
     c_int = np.array(lattice.c, dtype=int).T.tolist()   
     c = jnp.array(lattice.c, dtype=jnp.float64).T       
     w = jnp.array(lattice.w, dtype=jnp.float64)
@@ -155,16 +148,8 @@ def run_simulation():
     Q_m3s = args.flow_rate / 3.6e9  
     cross_section_area_m2 = float(np.sum(circular_mask_np)) * (dx_m ** 2)
     u_phys_inlet = Q_m3s / cross_section_area_m2 
-    u_lb = u_phys_inlet * (dt_s / dx_m)
-    # Cap lattice inlet velocity to 0.02 to stay in the low-Mach stable regime.
-    # Flow rates that would exceed this are physically represented at the capped speed;
-    # increase --steps proportionally to preserve the same physical duration.
-    U_LB_MAX = 0.02
-    if u_lb > U_LB_MAX:
-        print(f"  [Warning] u_lb={u_lb:.4f} exceeds stability limit {U_LB_MAX}. Capping to {U_LB_MAX}.")
-        print(f"  [Hint] Increase --steps by ~{u_lb/U_LB_MAX:.1f}x to maintain physical duration.")
-        u_lb = U_LB_MAX
-
+    u_lb = u_phys_inlet * (dt_s / dx_m)          
+    
     vol_scale_mm3 = dx_mm ** 3
     k_scale_m2 = dx_m ** 2
     k_scale_darcy = k_scale_m2 / 0.9869233e-12  
@@ -195,76 +180,36 @@ def run_simulation():
     )
     
     # 2. ปฏิสัมพันธ์ Shan-Chen
+    g_kk_val = jnp.array([-1.0, -1.0], dtype=jnp.float64) 
     g_kkprime_val = jnp.array([
         [0.0, 0.57], 
         [0.57, 0.0]
     ], dtype=jnp.float64)
-
-    # 3. MRT transform matrix for D3Q19
-    e = np.array(lattice.c, dtype=np.float64).T
-    en = np.linalg.norm(e, axis=1)
-    M = np.zeros((19, 19), dtype=np.float64)
-    M[0, :] = en**0
-    M[1, :] = 19 * en**2 - 30
-    M[2, :] = (21 * en**4 - 53 * en**2 + 24) / 2
-    M[3, :] = e[:, 0]
-    M[4, :] = (5 * en**2 - 9) * e[:, 0]
-    M[5, :] = e[:, 1]
-    M[6, :] = (5 * en**2 - 9) * e[:, 1]
-    M[7, :] = e[:, 2]
-    M[8, :] = (5 * en**2 - 9) * e[:, 2]
-    M[9, :] = 3 * e[:, 0] ** 2 - en**2
-    M[10, :] = (3 * en**2 - 5) * (3 * e[:, 0] ** 2 - en**2)
-    M[11, :] = e[:, 1] ** 2 - e[:, 2] ** 2
-    M[12, :] = (3 * en**2 - 5) * (e[:, 1] ** 2 - e[:, 2] ** 2)
-    M[13, :] = e[:, 0] * e[:, 1]
-    M[14, :] = e[:, 1] * e[:, 2]
-    M[15, :] = e[:, 0] * e[:, 2]
-    M[16, :] = (e[:, 1] ** 2 - e[:, 2] ** 2) * e[:, 0]
-    M[17, :] = (e[:, 2] ** 2 - e[:, 0] ** 2) * e[:, 1]
-    M[18, :] = (e[:, 0] ** 2 - e[:, 1] ** 2) * e[:, 2]
     
-    # 4. เตรียมขนาดโดเมน (Grid Size) เผื่อ LBMBase ต้องการ
+    # 3. เตรียมขนาดโดเมน (Grid Size) เผื่อ LBMBase ต้องการ
     nx, ny, nz = mask.shape
-
-    # 5. MRT relaxation parameters
-    s_rho = [0.0, 0.0]
-    s_e = [1.0, 1.0]
-    s_eta = [1.0, 1.0]
-    s_j = [1.0, 1.0]
-    s_q = [1.2, 1.2]
-    s_v = [1.0, 1.0]
-    s_pi = [1.0, 1.0]
-    s_m = [1.0, 1.0]
     
-    # 6. สร้าง Object ของ Simulator โดยอัด kwargs ให้ครบทุกระดับ!
+    # 4. สร้าง Object ของ Simulator โดยอัด kwargs ให้ครบทุกระดับ!
     sim = ReactiveMCMP_Simulator(
         # --- Custom Physics Kwargs ---
         mask=mask,
-
+        kappa_mrt=0.10,           # ลดแรงตึงผิวช่วงต้นเพื่อความเสถียร
+        
         # --- LBMBase Kwargs (Core) ---
         lattice=lattice,
-        precision="f64/f64",
-        nx=nx,
+        precision="f64",
+        collision_type="mrt",
+        nx=nx,                    # บางเวอร์ชันของ LBMBase บังคับเช็ค Grid size
         ny=ny,
         nz=nz,
-
+        omega=[1.0, 1.0],         # ความถี่การผ่อนคลายของ 2 Components
+        tau=[1.0, 1.0],           # ใส่เผื่อไว้กรณีที่บางเมธอดเช็ค tau แทน omega
+        
         # --- Multiphase Kwargs ---
-        EOS=pr_eos,               # ต้องใช้ชื่อ EOS (ตัวพิมพ์ใหญ่) ตาม Multiphase.__init__
+        eos=pr_eos,
         n_components=2,           # บังคับระบุจำนวน Component อย่างชัดเจน
-        k=[1.0, 1.0],             # Modification coefficient สำหรับ EOS potential
-        kappa=[0.1, 0.1],         # MRT surface tension tuning
-        A=0.1 * np.ones((2, 2)),  # Zhang-Chen weighting: 0.1 improves stability at high density ratios
-        g_kkprime=g_kkprime_val,
-        s_rho=s_rho,
-        s_e=s_e,
-        s_eta=s_eta,
-        s_j=s_j,
-        s_q=s_q,
-        s_v=s_v,
-        s_pi=s_pi,
-        s_m=s_m,
-        M=[M, M],
+        g_kk=g_kk_val,
+        g_kkprime=g_kkprime_val
     )
 
     # ---------------------------------------------------------
@@ -272,12 +217,12 @@ def run_simulation():
     # ---------------------------------------------------------
     T_hot, T_cold, C_inlet = 75.0, 25.0, 1.0
     
-    rho1 = jnp.full(mask.shape, 1e-4, dtype=jnp.float64)
+    rho1 = jnp.zeros(mask.shape, dtype=jnp.float64) 
     rho2 = jnp.ones(mask.shape, dtype=jnp.float64) * 0.5 # Native Air
     u_init = jnp.zeros(mask.shape + (3,), dtype=jnp.float64)
     
-    f1 = sim.equilibrium(rho1[..., None], u_init).astype(jnp.float64)
-    f2 = sim.equilibrium(rho2[..., None], u_init).astype(jnp.float64)
+    f1 = sim.compute_equilibrium(rho1, u_init)
+    f2 = sim.compute_equilibrium(rho2, u_init)
     f_tree = [f1, f2] # โครงสร้าง PyTree สำหรับ MCMP
     
     T_field = jnp.ones(mask.shape, dtype=jnp.float64) * T_cold
@@ -300,9 +245,6 @@ def run_simulation():
         zs_dst = slice(max(sz, 0), a.shape[2] - max(-sz, 0))
         return out.at[xs_dst, ys_dst, zs_dst].set(a[xs_src, ys_src, zs_src])
 
-    g = calc_equilibrium_single(T_field, u_init)
-    h = calc_equilibrium_single(C_field, u_init)
-
     @jit
     def lbm_step(state, step_idx):
         f_tree, g, h, solid_frac = state
@@ -310,14 +252,13 @@ def run_simulation():
         # 1. Update Macroscopic ของไหล
         rho_tree, _ = sim.update_macroscopic(f_tree)
         u_eq = sim.macroscopic_velocity(f_tree, rho_tree)
-        u_eq = jnp.nan_to_num(u_eq, nan=0.0, posinf=0.1, neginf=-0.1)
         rho1, rho2 = rho_tree
         
-        T_curr = jnp.nan_to_num(jnp.sum(g, axis=-1), nan=T_cold, posinf=T_hot, neginf=T_cold)
-        C_curr = jnp.nan_to_num(jnp.sum(h, axis=-1), nan=0.0, posinf=2.0, neginf=0.0)
+        T_curr = jnp.sum(g, axis=-1)
+        C_curr = jnp.sum(h, axis=-1)
         
-        # 2. [COLLISION] ใช้ MRT collision จาก JAX-LaB โดยตรง
-        f_post_tree = sim.collision(f_tree)
+        # 2. [COLLISION] ใช้ Override Method ที่มี PR-EOS, Wettability และ Kappa
+        f_post_tree = sim.collision(f_tree, T_curr)
         f1_post, f2_post = f_post_tree
         
         # Collision สำหรับความร้อนและสารละลาย (T, C)
@@ -364,10 +305,12 @@ def run_simulation():
         # 5. [INLET/OUTLET BOUNDARY CONDITIONS] - Soft Start
         ramp_factor = jnp.clip(step_idx / 500.0, 0.0, 1.0)
         current_u_lb = u_lb * ramp_factor
+        target_u_dynamic = jnp.zeros(3).at[0].set(current_u_lb)
+        
         if args.axis == 'X':
             u_in = jnp.zeros_like(u_eq[0]).at[..., 0].set(current_u_lb)
-            f1_eq_in = calc_equilibrium_single(jnp.ones_like(rho1[0, ..., 0]), u_in)
-            f2_eq_in = calc_equilibrium_single(jnp.zeros_like(rho2[0, ..., 0]), u_in)
+            f1_eq_in = calc_equilibrium_single(jnp.ones_like(rho1[0]), u_in)
+            f2_eq_in = calc_equilibrium_single(jnp.zeros_like(rho2[0]), u_in) 
             g_eq_in = calc_equilibrium_single(jnp.ones_like(T_curr[0]) * T_hot, u_in)
             h_eq_in = calc_equilibrium_single(jnp.ones_like(C_curr[0]) * C_inlet, u_in)
             
@@ -381,16 +324,11 @@ def run_simulation():
             g_str = g_str.at[-1].set(jnp.where(circular_mask[..., None], g_str[-2], g_str[-1]))
             h_str = h_str.at[-1].set(jnp.where(circular_mask[..., None], h_str[-2], h_str[-1]))
 
-        f1_str = jnp.nan_to_num(f1_str, nan=0.0, posinf=1e6, neginf=-1e6)
-        f2_str = jnp.nan_to_num(f2_str, nan=0.0, posinf=1e6, neginf=-1e6)
-        g_str = jnp.nan_to_num(g_str, nan=0.0, posinf=1e6, neginf=-1e6)
-        h_str = jnp.nan_to_num(h_str, nan=0.0, posinf=1e6, neginf=-1e6)
-        solid_frac = jnp.clip(jnp.nan_to_num(solid_frac, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
-
         f_tree_out = [f1_str, f2_str]
         return (f_tree_out, g_str, h_str, solid_frac), None
 
     chunk_size = 500
+    num_chunks = args.steps // chunk_size
     
     @jit(static_argnums=(1,))
     def run_chunk(state_in, steps, chunk_start):
@@ -412,7 +350,7 @@ def run_simulation():
     D_solute = (1.0/3.0) * (tau_c - 0.5)
 
     print(f"Running Reactive MCMP (PR-EOS) {args.steps} LBM steps with comprehensive I/O...")
-    state = (f_tree, g, h, solid_fraction)
+    state = (f_tree, T_field, C_field, solid_fraction)
     mask_cpu = np.array(mask)
     mid_x, mid_y, mid_z = mask_cpu.shape[0]//2, mask_cpu.shape[1]//2, mask_cpu.shape[2]//2
     
@@ -421,9 +359,13 @@ def run_simulation():
     pe_da_data = [] 
     maps_data = {} 
     
-    current_step = 0
-    while True:
+    for i in range(num_chunks + 1):
+        if i > 0:
+            chunk_start_step = (i - 1) * chunk_size
+            state = run_chunk(state, chunk_size, chunk_start_step)
+            
         state[0][0].block_until_ready()
+        current_step = i * chunk_size
         
         if current_step == 0 or current_step % 500 == 0:
             f_tree_np, g_np, h_np, solid_np = state
@@ -503,11 +445,6 @@ def run_simulation():
 
             max_supersat = np.max(supersat_map[fluid_mask_current]) if np.any(fluid_mask_current) else 0.0
 
-            # Pseudopotential stability diagnostics (PR-EOS singularity check)
-            rho_tree_diag = [jnp.array(rho1_np[..., None]), jnp.array(rho2_np[..., None])]
-            from src.physics.stability_utils import log_pseudopotential_stability
-            log_pseudopotential_stability(rho_tree_diag, pr_eos, current_step, fluid_mask=mask_cpu)
-
             with open("outputs/global_kinetics.csv", "a", newline="") as f_csv1, \
                  open("outputs/object_analysis.csv", "a", newline="") as f_csv2, \
                  open("outputs/pore_clogging_stats.csv", "a", newline="") as f_csv3:
@@ -516,13 +453,6 @@ def run_simulation():
                 csv.writer(f_csv3).writerow([current_step, min_throat, tortuosity])
 
             print(f"Step {current_step}/{args.steps} | Time: {time_s:.2f} s | Porosity: {porosity:.4f} | Crystals: {num_features} | k: {k_perm_darcy:.2e} Darcy | Max Supersat: {max_supersat:.4f} | Crystal Vol: {current_solid_vol_mm3:.2e} mm3")
-
-        if current_step >= args.steps:
-            break
-
-        steps_this_chunk = min(chunk_size, args.steps - current_step)
-        state = run_chunk(state, steps_this_chunk, current_step)
-        current_step += steps_this_chunk
 
     vel_mag_tfinal = u_mag[fluid_mask_current]
     
