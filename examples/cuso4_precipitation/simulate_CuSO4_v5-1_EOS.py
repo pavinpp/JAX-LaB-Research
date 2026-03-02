@@ -23,7 +23,7 @@ from src.physics.wettability import compute_virtual_density
 # -------------------------------------------------------------------
 # [JAX-LaB Core Imports]
 # -------------------------------------------------------------------
-from src.multiphase import Multiphase
+from src.multiphase import MultiphaseBGK
 from src.eos import Peng_Robinson
 
 def parse_ui_args():
@@ -59,7 +59,7 @@ def calculate_tau_f(T_celsius, tau_ref=1.0):
 # =========================================================================
 # คลาสจำลอง Reactive MCMP Simulator (สืบทอดจาก Multiphase Core)
 # =========================================================================
-class ReactiveMCMP_Simulator(Multiphase):
+class ReactiveMCMP_Simulator(MultiphaseBGK):
     def __init__(self, mask, kappa_mrt=0.15, **kwargs):
         super().__init__(**kwargs)
         self.solid_mask = ~mask
@@ -69,14 +69,17 @@ class ReactiveMCMP_Simulator(Multiphase):
     def macroscopic_velocity(self, fin_tree, rho_tree):
         # 1. แทรก Wettability: ปรับความหนาแน่นจำลองที่ขอบของแข็ง (มุม 45 องศา)
         rho_tree_wet = jax_map(
-            lambda rho: compute_virtual_density(rho, self.solid_mask, self.fluid_mask, theta=jnp.pi/4, phi=0.8, delta_rho=0.05), 
+            lambda rho: compute_virtual_density(rho, self.solid_mask, self.fluid_mask, theta=jnp.pi/4, phi=0.8, delta_rho=0.05),
             rho_tree
         )
-        
-        # 2. ให้ JAX-LaB คำนวณความเร็วสมดุลด้วย PR-EOS และ Shan-Chen Forces
-        u_eq = super().macroscopic_velocity(fin_tree, rho_tree_wet)
-        
-        # 3. [STABILITY] จํากัดความเร็ว (Clipping) ป้องกันโค้ดระเบิดช่วงแรก
+
+        # 2. ให้ JAX-LaB คำนวณความเร็วต่อ component ด้วย PR-EOS และ Shan-Chen Forces
+        u_tree = super().macroscopic_velocity(fin_tree, rho_tree_wet)
+
+        # 3. คำนวณความเร็วรวม (mass-averaged) เพื่อให้เป็น single array
+        u_eq = self.compute_total_velocity(rho_tree_wet, u_tree)
+
+        # 4. [STABILITY] จํากัดความเร็ว (Clipping) ป้องกันโค้ดระเบิดช่วงแรก
         u_eq = jnp.clip(u_eq, -0.1, 0.1)
         return u_eq
 
@@ -91,7 +94,7 @@ class ReactiveMCMP_Simulator(Multiphase):
         # 3. ดึงความหนาแน่นและความเร็วมาคำนวณสมดุล (f_eq) เพื่อใช้ในเทอม Source
         rho_tree, _ = self.update_macroscopic(fin_tree)
         u_eq = self.macroscopic_velocity(fin_tree, rho_tree)
-        feq_tree = jax_map(lambda rho: self.compute_equilibrium(rho, u_eq), rho_tree)
+        feq_tree = jax_map(lambda rho: self.equilibrium(rho, u_eq), rho_tree)
         
         # 4. บวกเทอม Surface Tension (kappa) ทับลงไปบนผลลัพธ์ของคลาสแม่
         fout_tree_modified = jax_map(
@@ -194,21 +197,20 @@ def run_simulation():
         # --- Custom Physics Kwargs ---
         mask=mask,
         kappa_mrt=0.10,           # ลดแรงตึงผิวช่วงต้นเพื่อความเสถียร
-        
+
         # --- LBMBase Kwargs (Core) ---
         lattice=lattice,
         precision="f64",
-        collision_type="mrt",
-        nx=nx,                    # บางเวอร์ชันของ LBMBase บังคับเช็ค Grid size
+        nx=nx,
         ny=ny,
         nz=nz,
         omega=[1.0, 1.0],         # ความถี่การผ่อนคลายของ 2 Components
-        tau=[1.0, 1.0],           # ใส่เผื่อไว้กรณีที่บางเมธอดเช็ค tau แทน omega
-        
+
         # --- Multiphase Kwargs ---
-        eos=pr_eos,
+        EOS=pr_eos,               # ต้องใช้ชื่อ EOS (ตัวพิมพ์ใหญ่) ตาม Multiphase.__init__
         n_components=2,           # บังคับระบุจำนวน Component อย่างชัดเจน
-        g_kk=g_kk_val,
+        k=[1.0, 1.0],             # Modification coefficient สำหรับ EOS potential
+        A=np.zeros((2, 2)),       # Zhang-Chen weighting (0 = pure Shan-Chen)
         g_kkprime=g_kkprime_val
     )
 
@@ -221,8 +223,8 @@ def run_simulation():
     rho2 = jnp.ones(mask.shape, dtype=jnp.float64) * 0.5 # Native Air
     u_init = jnp.zeros(mask.shape + (3,), dtype=jnp.float64)
     
-    f1 = sim.compute_equilibrium(rho1, u_init)
-    f2 = sim.compute_equilibrium(rho2, u_init)
+    f1 = sim.equilibrium(rho1, u_init)
+    f2 = sim.equilibrium(rho2, u_init)
     f_tree = [f1, f2] # โครงสร้าง PyTree สำหรับ MCMP
     
     T_field = jnp.ones(mask.shape, dtype=jnp.float64) * T_cold
@@ -309,8 +311,8 @@ def run_simulation():
         
         if args.axis == 'X':
             u_in = jnp.zeros_like(u_eq[0]).at[..., 0].set(current_u_lb)
-            f1_eq_in = calc_equilibrium_single(jnp.ones_like(rho1[0]), u_in)
-            f2_eq_in = calc_equilibrium_single(jnp.zeros_like(rho2[0]), u_in) 
+            f1_eq_in = calc_equilibrium_single(jnp.ones_like(rho1[0, ..., 0]), u_in)
+            f2_eq_in = calc_equilibrium_single(jnp.zeros_like(rho2[0, ..., 0]), u_in)
             g_eq_in = calc_equilibrium_single(jnp.ones_like(T_curr[0]) * T_hot, u_in)
             h_eq_in = calc_equilibrium_single(jnp.ones_like(C_curr[0]) * C_inlet, u_in)
             
