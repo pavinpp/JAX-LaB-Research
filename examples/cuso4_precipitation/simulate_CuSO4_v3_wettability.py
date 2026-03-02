@@ -2,11 +2,8 @@ import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 import jax
-# บังคับ JAX ทำงานด้วย float64 เพื่อความเสถียรของ MCMP และ Inversion
-jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from jax import jit
-from jax.tree import map as jax_map
 import csv
 import os
 import sys
@@ -20,15 +17,8 @@ from src.physics.crystallization import compute_heterogeneous_precipitation, cal
 from src.physics.porous_media import compute_permeability, compute_supersaturation
 from src.physics.wettability import compute_virtual_density
 
-# -------------------------------------------------------------------
-# [JAX-LaB Core Imports]
-# -------------------------------------------------------------------
-# แก้ไข 1: เปลี่ยนมาใช้ MultiphaseMRT โดยตรง
-from src.multiphase import MultiphaseMRT
-from src.eos import Peng_Robinson
-
 def parse_ui_args():
-    parser = argparse.ArgumentParser(description="JAX-LaB CuSO4 (v5 PR-EOS MCMP MRT)")
+    parser = argparse.ArgumentParser(description="JAX-LaB CuSO4 Crystallization")
     parser.add_argument("--geom", type=str, default="geometry_mask.npy")
     parser.add_argument("--axis", type=str, choices=['X', 'Y', 'Z'], default='X')
     parser.add_argument("--flow_rate", type=float, default=1.0, help="Flow rate in mL/hr")
@@ -50,86 +40,13 @@ def save_vti_file(filename, array, name, is_vector=False):
 
 @jit
 def calculate_tau_f(T_celsius, tau_ref=1.0):
-    temp_points = jnp.array([25.0, 35.0, 45.0, 55.0, 65.0, 75.0], dtype=jnp.float64)
-    viscosity_points = jnp.array([1.35, 1.08, 0.89, 0.74, 0.63, 0.55], dtype=jnp.float64)
+    temp_points = jnp.array([25.0, 35.0, 45.0, 55.0, 65.0, 75.0])
+    viscosity_points = jnp.array([1.35, 1.08, 0.89, 0.74, 0.63, 0.55])
     mu_T = jnp.interp(T_celsius, temp_points, viscosity_points)
     mu_ref = 1.35 
     tau_f = 0.5 + (tau_ref - 0.5) * (mu_T / mu_ref)
     return tau_f
 
-def build_mrt_matrix(c_np):
-    cx, cy, cz = c_np[:, 0], c_np[:, 1], c_np[:, 2]
-    c2 = cx**2 + cy**2 + cz**2
-    M = np.zeros((19, 19), dtype=np.float64)
-    M[0] = 1.0                                                  
-    M[1] = 19.0 * c2 - 30.0                                     
-    M[2] = (21.0 * c2**2 - 53.0 * c2 + 24.0) / 2.0              
-    M[3] = cx                                                   
-    M[4] = (5.0 * c2 - 9.0) * cx                                
-    M[5] = cy                                                   
-    M[6] = (5.0 * c2 - 9.0) * cy                                
-    M[7] = cz                                                   
-    M[8] = (5.0 * c2 - 9.0) * cz                                
-    M[9] = 3.0 * cx**2 - c2                                     
-    M[10] = (3.0 * c2 - 5.0) * (3.0 * cx**2 - c2)               
-    M[11] = cy**2 - cz**2                                       
-    M[12] = (3.0 * c2 - 5.0) * (cy**2 - cz**2)                  
-    M[13] = cx * cy                                             
-    M[14] = cy * cz                                             
-    M[15] = cz * cx                                             
-    M[16] = (cy**2 - cz**2) * cx                                
-    M[17] = (cz**2 - cx**2) * cy                                
-    M[18] = (cx**2 - cy**2) * cz                                
-    return M
-
-# =========================================================================
-# คลาสจำลอง Reactive MCMP Simulator (สืบทอดจาก MultiphaseMRT)
-# =========================================================================
-class ReactiveMCMP_Simulator(MultiphaseMRT):
-    def __init__(self, mask, **kwargs):
-        super().__init__(**kwargs)
-        self.solid_mask = ~mask
-        self.fluid_mask = mask
-        
-    def macroscopic_velocity(self, fin_tree, rho_tree):
-        # แทรก Wettability (Virtual Density) ก่อนส่งให้ Multiphase คำนวณความเร็ว
-        rho_tree_wet = jax_map(
-            lambda rho: compute_virtual_density(rho, self.solid_mask, self.fluid_mask, theta=jnp.pi/4, phi=0.8, delta_rho=0.05), 
-            rho_tree
-        )
-        
-        # ให้ JAX-LaB คำนวณ u_eq โดยใช้ PR-EOS และพารามิเตอร์การชนที่ตั้งไว้
-        u_eq = super().macroscopic_velocity(fin_tree, rho_tree_wet)
-        
-        # [STABILITY] Clipping ป้องกันความเร็วกระชากในช่วง Warm-up ของ Interface
-        u_eq = jnp.clip(u_eq, -0.1, 0.1)
-        return u_eq
-
-    def collision(self, fin_tree, T_field):
-        # 1. คลาสแม่ทำการชนแบบ MRT (พร้อมกับแนบ Surface Tension k เข้าไปให้แล้วโดยอัตโนมัติ!)
-        fout_tree = super().collision(fin_tree)
-        
-        # 2. คำนวณ Variable Viscosity ตามอุณหภูมิ
-        tau_f_local = calculate_tau_f(T_field, tau_ref=1.0)
-        omega_local = 1.0 / tau_f_local
-        
-        # 3. สร้าง Correction Term (BGK-style correction บน MRT) 
-        # เนื่องจาก MultiphaseMRT ใช้ omega คงที่ เราจะปรับชดเชยส่วนต่างนี้ลงใน Population space 
-        # แก้ไข 4 & 3: เรียก self.equilibrium แบบ Native ของ JAX-LaB (รองรับ PyTree อัตโนมัติ)
-        rho_tree, _ = self.update_macroscopic(fin_tree)
-        u_eq = self.macroscopic_velocity(fin_tree, rho_tree)
-        feq_tree = self.equilibrium(rho_tree, u_eq)
-        
-        omega_base = self.omega[0] # ดึงค่า omega พื้นฐานที่ใส่เข้าไป
-        fout_tree_modified = jax_map(
-            lambda fout, f, feq: fout + (omega_local[..., None] - omega_base) * (feq - f),
-            fout_tree, fin_tree, feq_tree
-        )
-        return fout_tree_modified
-
-# =========================================================================
-# ฟังก์ชันคำนวณ LBM หลัก
-# =========================================================================
 def run_simulation():
     args = parse_ui_args()
     
@@ -145,22 +62,27 @@ def run_simulation():
     
     mask = jnp.array(mask_np_full[xs:xe, ys:ye, zs:ze])
     
+    # =======================================================
+    # สร้าง Circular Mask สำหรับ Inlet และ Outlet
+    # =======================================================
     ny, nz = mask.shape[1], mask.shape[2]
     Y, Z = np.meshgrid(np.arange(ny), np.arange(nz), indexing='ij')
+    
+    # เส้นผ่านศูนย์กลาง 60 -> รัศมี 30
     radius = 30.0 
+    # วาง Center แกน Y ให้อยู่ตรงกลาง และ Center แกน Z อยู่ที่ระยะเท่ากับรัศมี 
+    # เพื่อให้ขอบล่างของวงกลมแตะพื้น Z=0 (Continuous with bottom of porous media)
     cy, cz = ny / 2.0, radius 
+    
     r_sq = (Y - cy)**2 + (Z - cz)**2
-    circular_mask_np = r_sq <= radius**2          # <--- เอาบรรทัดนี้กลับมา
-    circular_mask = jnp.array(circular_mask_np)
+    circular_mask_np = r_sq <= radius**2
+    circular_mask = jnp.array(circular_mask_np) # JAX array สำหรับการรันแบบ JIT
     
     lattice = LatticeD3Q19()
     c_int = np.array(lattice.c, dtype=int).T.tolist()   
-    c = jnp.array(lattice.c, dtype=jnp.float64).T       
-    w = jnp.array(lattice.w, dtype=jnp.float64)
-    c_np = np.array(lattice.c, dtype=np.float64).T 
-    
-    # คำนวณ M Matrix
-    M_np = build_mrt_matrix(c_np)
+    c = jnp.array(lattice.c, dtype=jnp.float32).T       
+    w = jnp.array(lattice.w, dtype=jnp.float32)
+    c_np = np.array(lattice.c, dtype=np.float32).T 
     
     dx_m = args.dx_um * 1e-6    
     dx_mm = args.dx_um * 1e-3   
@@ -169,14 +91,14 @@ def run_simulation():
     tau_f_ref = 1.0   
     tau_t = 0.55  
     tau_c = 0.95  
-    k_r = 0.15
-    omega_t, omega_c = 1.0/tau_t, 1.0/tau_c
     
     nu_lb = (tau_f_ref - 0.5) / 3.0
     dt_s = (nu_lb * (dx_m ** 2)) / nu_phys 
     
     Q_m3s = args.flow_rate / 3.6e9  
-    cross_section_area_m2 = float(np.sum(r_sq <= radius**2)) * (dx_m ** 2)
+    
+    # แก้ไขพื้นที่หน้าตัดให้คำนวณจากวงกลม ไม่ใช่สี่เหลี่ยมเต็มแผ่น
+    cross_section_area_m2 = float(np.sum(circular_mask_np)) * (dx_m ** 2)
     u_phys_inlet = Q_m3s / cross_section_area_m2 
     u_lb = u_phys_inlet * (dt_s / dx_m)          
     
@@ -185,90 +107,32 @@ def run_simulation():
     k_scale_darcy = k_scale_m2 / 0.9869233e-12  
     u_scale_mms = (dx_mm / dt_s)                
     
-    print("\n--- Physical Scales Confirmed (MCMP PR-EOS MRT Mode) ---")
+    print("\n--- Physical Scales Confirmed ---")
     print(f"  Voxel Size: {args.dx_um} um")
     print(f"  Time Step (dt): {dt_s:.2e} s")
     print(f"  Inlet Velocity (Target): {u_phys_inlet*1000:.2f} mm/s (LBM: {u_lb:.4f})")
-    print("--------------------------------------------------------\n")
+    print("---------------------------------\n")
 
-    # ---------------------------------------------------------
-    # ตั้งค่า Native JAX-LaB Core แบบ Bullet-Proof สำหรับ MultiphaseMRT
-    # ---------------------------------------------------------
-    pr_eos = Peng_Robinson(
-        a=[0.02, 0.02], b=[0.05, 0.05], R=[1.0, 1.0], 
-        Tc=[1.0, 1.0], pr_omega=[0.344, 0.344], T=0.85
-    )
-    
-    # 1. ดึงเวกเตอร์ทิศทาง (c_np) และสร้าง MRT Matrix (M_np) ก่อน
-    c_np = np.array(lattice.c, dtype=np.float64).T 
-    M_np = build_mrt_matrix(c_np)
-    
-    # 2. ดึงขนาดโดเมน
-    nx, ny, nz = mask.shape
-    
-    # 3. เตรียม Interaction Parameters
-    g_kk_val = jnp.array([-1.0, -1.0], dtype=jnp.float64) 
-    g_kkprime_val = jnp.array([
-        [0.0, 0.57], 
-        [0.57, 0.0]
-    ], dtype=jnp.float64)
-    A_val = jnp.array([
-        [0.0, 0.0], 
-        [0.0, 0.0]
-    ], dtype=jnp.float64)
-    
-    # 4. สร้าง Simulator Object (จัดเรียงพารามิเตอร์ไม่ให้ซ้ำซ้อน)
-    sim = ReactiveMCMP_Simulator(
-        mask=mask,
-        lattice=lattice,
-        precision="f64",
-        n_components=2,           
-        EOS=pr_eos,               
-        g_kk=g_kk_val,
-        g_kkprime=g_kkprime_val,
-        A=A_val,                  
-        k=[0.10, 0.10],           
-        M=[M_np, M_np],           # ส่ง M_np ที่เพิ่งสร้างด้านบนเข้าไป
-        omega=[1.0/tau_f_ref, 1.0/tau_f_ref],
-        tau=[tau_f_ref, tau_f_ref],
-        nx=nx,
-        ny=ny,
-        nz=nz,
-        
-        # Relaxation Rates แบบ MRT สำหรับ D3Q19
-        s_rho=[0.0, 0.0],
-        s_e=[1.19, 1.19],
-        s_eta=[1.4, 1.4],         
-        s_j=[0.0, 0.0],
-        s_q=[1.2, 1.2],
-        s_v=[1.0/tau_f_ref, 1.0/tau_f_ref], 
-        s_pi=[1.4, 1.4],
-        s_m=[1.98, 1.98]
-    )
-
-    # ---------------------------------------------------------
-    # Initialize State Variables ด้วย PyTree
-    # ---------------------------------------------------------
+    omega_t, omega_c = 1.0/tau_t, 1.0/tau_c
+    k_r = 0.15    
     T_hot, T_cold, C_inlet = 75.0, 25.0, 1.0
     
-    rho1 = jnp.zeros(mask.shape, dtype=jnp.float64) 
-    rho2 = jnp.ones(mask.shape, dtype=jnp.float64) * 0.5 
-    u_init = jnp.zeros(mask.shape + (3,), dtype=jnp.float64)
-    
-    rho_tree_init = [rho1, rho2]
-    # แก้ไข 4: ให้ sim.equilibrium รับ PyTree จัดการ jax_map ให้เบ็ดเสร็จภายใน
-    f_tree = sim.equilibrium(rho_tree_init, u_init)
-    
-    T_field = jnp.ones(mask.shape, dtype=jnp.float64) * T_cold
-    C_field = jnp.zeros(mask.shape, dtype=jnp.float64)
-    solid_fraction = jnp.zeros(mask.shape, dtype=jnp.float64)
+    rho = jnp.ones(mask.shape, dtype=jnp.float32)
+    u = jnp.zeros(mask.shape + (3,), dtype=jnp.float32)
+    T = jnp.ones(mask.shape, dtype=jnp.float32) * T_cold
+    C = jnp.zeros(mask.shape, dtype=jnp.float32)
+    solid_fraction = jnp.zeros(mask.shape, dtype=jnp.float32)
 
     @jit
-    def calc_equilibrium_single(phi, u_eq):
-        cu = jnp.dot(u_eq, c.T)
-        usqr = jnp.sum(u_eq**2, axis=-1, keepdims=True)
+    def calc_equilibrium(phi, u):
+        cu = jnp.dot(u, c.T)
+        usqr = jnp.sum(u**2, axis=-1, keepdims=True)
         return phi[..., None] * w * (1.0 + 3.0*cu + 4.5*(cu**2) - 1.5*usqr)
-
+    
+    f = calc_equilibrium(rho, u)
+    g = calc_equilibrium(T, u)
+    h = calc_equilibrium(C, u)
+    
     def shift_no_wrap(a, sx, sy, sz):
         out = jnp.zeros_like(a)
         xs_src = slice(max(-sx, 0), a.shape[0] - max(sx, 0))
@@ -281,86 +145,102 @@ def run_simulation():
 
     @jit
     def lbm_step(state, step_idx):
-        f_tree, g, h, solid_frac = state
+        f, g, h, solid_frac = state
         
-        # 1. อัปเดตตัวแปรมหภาค
-        rho_tree, _ = sim.update_macroscopic(f_tree)
-        u_eq = sim.macroscopic_velocity(f_tree, rho_tree)
-        rho1, rho2 = rho_tree
+        # 1. Macroscopic variables
+        rho = jnp.sum(f, axis=-1)
+        u = jnp.dot(f, c) / rho[..., None]
+        T = jnp.sum(g, axis=-1)
+        C = jnp.sum(h, axis=-1)
         
-        T_curr = jnp.sum(g, axis=-1)
-        C_curr = jnp.sum(h, axis=-1)
-        
-        # 2. [COLLISION]
-        f_post_tree = sim.collision(f_tree, T_curr)
-        f1_post, f2_post = f_post_tree
-        
-        g_post = g - omega_t * (g - calc_equilibrium_single(T_curr, u_eq))
-        h_post = h - omega_c * (h - calc_equilibrium_single(C_curr, u_eq))
-        
-        # 3. [PRECIPITATION KINETICS]
+        # Identify masks early for the wettability scheme
         effective_fluid_mask = mask & (solid_frac < 0.5)
-        wall_mask = jnp.zeros_like(effective_fluid_mask, dtype=bool)
-        if args.axis == 'X':
-            wall_mask = wall_mask.at[:, 0, :].set(True)
-            wall_mask = wall_mask.at[:, -1, :].set(True)
-            wall_mask = wall_mask.at[:, :, 0].set(True)
-            wall_mask = wall_mask.at[:, :, -1].set(True)
-            wall_mask = wall_mask.at[0, :, :].set(wall_mask[0, :, :] | ~circular_mask)
-            wall_mask = wall_mask.at[-1, :, :].set(wall_mask[-1, :, :] | ~circular_mask)
-            
-        effective_fluid_mask_bc = effective_fluid_mask & (~wall_mask)
-        delta_C = compute_heterogeneous_precipitation(C_curr, T_curr, k_r, effective_fluid_mask_bc, c_int)
-        h_post = h_post - w * delta_C[..., None]
-        solid_frac = solid_frac + delta_C
+        solid_mask_current = ~effective_fluid_mask
         
-        # 4. [STREAMING & BOUNCE-BACK] 
-        f1_str, f2_str = jnp.zeros_like(f1_post), jnp.zeros_like(f2_post)
-        g_str, h_str = jnp.zeros_like(g), jnp.zeros_like(h)
-        solid_mask_bc = ~effective_fluid_mask_bc
-        domain_ones = jnp.ones_like(mask, dtype=bool)
-        opp = jnp.array(lattice.opp_indices)
+        # ---------------------------------------------------------
+        # [WETTABILITY UPGRADE] Improved Virtual Density Scheme
+        # ---------------------------------------------------------
+        # Settings for Soda-Lime Glass (Highly Wetting)
+        theta_contact = 45.0 * (jnp.pi / 180.0)  # 45 degrees contact angle
+        phi_wet = 0.8                            # Local density weighting
+        delta_rho_wet = 0.05                     # Interaction strength parameter
         
-        for i in range(19):
-            sx, sy, sz = c_int[i][0], c_int[i][1], c_int[i][2]
-            f1_str_i = shift_no_wrap(f1_post[..., i], sx, sy, sz)
-            f2_str_i = shift_no_wrap(f2_post[..., i], sx, sy, sz)
-            g_str_i = shift_no_wrap(g_post[..., i], sx, sy, sz)
-            h_str_i = shift_no_wrap(h_post[..., i], sx, sy, sz)
-            
-            is_invalid = shift_no_wrap(solid_mask_bc, sx, sy, sz) | ~shift_no_wrap(domain_ones, sx, sy, sz)
-            
-            f1_str = f1_str.at[..., i].set(jnp.where(is_invalid, f1_post[..., opp[i]], f1_str_i))
-            f2_str = f2_str.at[..., i].set(jnp.where(is_invalid, f2_post[..., opp[i]], f2_str_i))
-            g_str = g_str.at[..., i].set(jnp.where(is_invalid, g_post[..., opp[i]], g_str_i))
-            h_str = h_str.at[..., i].set(jnp.where(is_invalid, h_post[..., opp[i]], h_str_i))
+        # Modify the density at the solid boundary to simulate surface tension
+        rho = compute_virtual_density(rho, solid_mask_current, effective_fluid_mask, theta_contact, phi_wet, delta_rho_wet)
+        # ---------------------------------------------------------
         
-        # 5. [INLET BOUNDARY] - Soft Start
+        # Soft Start (Velocity Ramping)
         ramp_factor = jnp.clip(step_idx / 500.0, 0.0, 1.0)
         current_u_lb = u_lb * ramp_factor
         target_u_dynamic = jnp.zeros(3).at[0].set(current_u_lb)
         
         if args.axis == 'X':
-            u_in = jnp.zeros_like(u_eq[0]).at[..., 0].set(current_u_lb)
-            f1_eq_in = calc_equilibrium_single(jnp.ones_like(rho1[0]), u_in)
-            f2_eq_in = calc_equilibrium_single(jnp.zeros_like(rho2[0]), u_in) 
-            g_eq_in = calc_equilibrium_single(jnp.ones_like(T_curr[0]) * T_hot, u_in)
-            h_eq_in = calc_equilibrium_single(jnp.ones_like(C_curr[0]) * C_inlet, u_in)
+            # Injection on Circular Mask... (Rest of your code remains exactly the same)
+            u = u.at[0].set(jnp.where(circular_mask[..., None], target_u_dynamic, u[0]))
+            rho = rho.at[0].set(jnp.where(circular_mask, 1.0, rho[0]))
+            T = T.at[0].set(jnp.where(circular_mask, T_hot, T[0]))
+            C = C.at[0].set(jnp.where(circular_mask, C_inlet, C[0]))
             
-            f1_str = f1_str.at[0].set(jnp.where(circular_mask[..., None], f1_eq_in, f1_str[0]))
-            f2_str = f2_str.at[0].set(jnp.where(circular_mask[..., None], f2_eq_in, f2_str[0]))
+        tau_f_local = calculate_tau_f(T, tau_ref=tau_f_ref)
+        omega_f_local = 1.0 / tau_f_local
+        
+        f_post = f - omega_f_local[..., None] * (f - calc_equilibrium(rho, u))
+        g_post = g - omega_t * (g - calc_equilibrium(T, u))
+        h_post = h - omega_c * (h - calc_equilibrium(C, u))
+        
+        effective_fluid_mask = mask & (solid_frac < 0.5)
+        wall_mask = jnp.zeros_like(effective_fluid_mask, dtype=bool)
+        
+        if args.axis == 'X':
+            wall_mask = wall_mask.at[:, 0, :].set(True)
+            wall_mask = wall_mask.at[:, -1, :].set(True)
+            wall_mask = wall_mask.at[:, :, 0].set(True)
+            wall_mask = wall_mask.at[:, :, -1].set(True)
+            
+            # ปิดพื้นที่สี่เหลี่ยมรอบๆ วงกลมให้กลายเป็นกำแพงกันน้ำ (Bounce-back)
+            wall_mask = wall_mask.at[0, :, :].set(wall_mask[0, :, :] | ~circular_mask)
+            wall_mask = wall_mask.at[-1, :, :].set(wall_mask[-1, :, :] | ~circular_mask)
+            
+        effective_fluid_mask_bc = effective_fluid_mask & (~wall_mask)
+        delta_C = compute_heterogeneous_precipitation(C, T, k_r, effective_fluid_mask_bc, c_int)
+        
+        h_post = h_post - w * delta_C[..., None]
+        solid_frac = solid_frac + delta_C
+        
+        f_str, g_str, h_str = jnp.zeros_like(f), jnp.zeros_like(g), jnp.zeros_like(h)
+        solid_mask = ~effective_fluid_mask_bc
+        domain_ones = jnp.ones_like(mask, dtype=bool)
+        opp = jnp.array(lattice.opp_indices)
+        
+        for i in range(19):
+            sx, sy, sz = c_int[i][0], c_int[i][1], c_int[i][2]
+            f_streamed_i = shift_no_wrap(f_post[..., i], sx, sy, sz)
+            g_streamed_i = shift_no_wrap(g_post[..., i], sx, sy, sz)
+            h_streamed_i = shift_no_wrap(h_post[..., i], sx, sy, sz)
+            
+            is_invalid = shift_no_wrap(solid_mask, sx, sy, sz) | ~shift_no_wrap(domain_ones, sx, sy, sz)
+            
+            f_str = f_str.at[..., i].set(jnp.where(is_invalid, f_post[..., opp[i]], f_streamed_i))
+            g_str = g_str.at[..., i].set(jnp.where(is_invalid, g_post[..., opp[i]], g_streamed_i))
+            h_str = h_str.at[..., i].set(jnp.where(is_invalid, h_post[..., opp[i]], h_streamed_i))
+        
+        if args.axis == 'X':
+            u_in = jnp.zeros_like(u[0]).at[..., 0].set(current_u_lb)
+            f_eq_in = calc_equilibrium(jnp.ones_like(rho[0]), u_in)
+            g_eq_in = calc_equilibrium(jnp.ones_like(T[0]) * T_hot, u_in)
+            h_eq_in = calc_equilibrium(jnp.ones_like(C[0]) * C_inlet, u_in)
+            
+            # บังคับการฉีดและไหลออกเฉพาะหน้าตัดวงกลมเท่านั้น (นอกวงกลมจะชนกำแพงเด้งกลับอัตโนมัติ)
+            f_str = f_str.at[0].set(jnp.where(circular_mask[..., None], f_eq_in, f_str[0]))
             g_str = g_str.at[0].set(jnp.where(circular_mask[..., None], g_eq_in, g_str[0]))
             h_str = h_str.at[0].set(jnp.where(circular_mask[..., None], h_eq_in, h_str[0]))
             
-            f1_str = f1_str.at[-1].set(jnp.where(circular_mask[..., None], f1_str[-2], f1_str[-1]))
-            f2_str = f2_str.at[-1].set(jnp.where(circular_mask[..., None], f2_str[-2], f2_str[-1]))
+            f_str = f_str.at[-1].set(jnp.where(circular_mask[..., None], f_str[-2], f_str[-1]))
             g_str = g_str.at[-1].set(jnp.where(circular_mask[..., None], g_str[-2], g_str[-1]))
             h_str = h_str.at[-1].set(jnp.where(circular_mask[..., None], h_str[-2], h_str[-1]))
 
-        f_tree_out = [f1_str, f2_str]
-        return (f_tree_out, g_str, h_str, solid_frac), None
+        return (f_str, g_str, h_str, solid_frac), None
 
-    # --- ส่วนของการรันและบันทึกผลเหมือนเดิม ---
     chunk_size = 500
     num_chunks = args.steps // chunk_size
     
@@ -373,18 +253,18 @@ def run_simulation():
     os.makedirs("outputs/vti", exist_ok=True)
     os.makedirs("outputs/analytics", exist_ok=True)
     
-    with open("outputs/global_kinetics.csv", "w", newline="") as f_csv1, \
-         open("outputs/object_analysis.csv", "w", newline="") as f_csv2, \
-         open("outputs/pore_clogging_stats.csv", "w", newline="") as f_csv3:
-        csv.writer(f_csv1).writerow(["Step", "Time_s", "Total_Solid_Volume_mm3", "Porosity", "Global_Permeability_Darcy", "Avg_Temperature"])
-        csv.writer(f_csv2).writerow(["Step", "Number_of_Crystals", "Avg_Crystal_Size", "Max_Crystal_Size", "Surface_Area"])
-        csv.writer(f_csv3).writerow(["Step", "Min_Throat_Size", "Tortuosity_Index"])
+    with open("outputs/global_kinetics.csv", "w", newline="") as f1, \
+         open("outputs/object_analysis.csv", "w", newline="") as f2, \
+         open("outputs/pore_clogging_stats.csv", "w", newline="") as f3:
+        csv.writer(f1).writerow(["Step", "Time_s", "Total_Solid_Volume_mm3", "Porosity", "Global_Permeability_Darcy", "Avg_Temperature"])
+        csv.writer(f2).writerow(["Step", "Number_of_Crystals", "Avg_Crystal_Size", "Max_Crystal_Size", "Surface_Area"])
+        csv.writer(f3).writerow(["Step", "Min_Throat_Size", "Tortuosity_Index"])
 
     domain_length = float(args.inject_size)
     D_solute = (1.0/3.0) * (tau_c - 0.5)
 
-    print(f"Running Reactive MCMP (PR-EOS) {args.steps} LBM steps with comprehensive I/O...")
-    state = (f_tree, T_field, C_field, solid_fraction)
+    print(f"Running Reactive {args.steps} LBM steps with comprehensive I/O...")
+    state = (f, g, h, solid_fraction)
     mask_cpu = np.array(mask)
     mid_x, mid_y, mid_z = mask_cpu.shape[0]//2, mask_cpu.shape[1]//2, mask_cpu.shape[2]//2
     
@@ -398,28 +278,15 @@ def run_simulation():
             chunk_start_step = (i - 1) * chunk_size
             state = run_chunk(state, chunk_size, chunk_start_step)
             
-        state[0][0].block_until_ready()
+        state[0].block_until_ready()
         current_step = i * chunk_size
         
         if current_step == 0 or current_step % 500 == 0:
-            f_tree_np, g_np, h_np, solid_np = state
-            f1_np, f2_np = [np.array(x) for x in f_tree_np]
-            g_np, h_np, solid_np = np.array(g_np), np.array(h_np), np.array(solid_np)
-            
-            rho1_np = np.sum(f1_np, axis=-1)
-            rho2_np = np.sum(f2_np, axis=-1)
-            rho_tot_np = rho1_np + rho2_np
-            
-            safe_rho1 = np.where(rho1_np == 0, 1e-8, rho1_np)
-            safe_rho2 = np.where(rho2_np == 0, 1e-8, rho2_np)
-            safe_rho_tot = np.where(rho_tot_np == 0, 1e-8, rho_tot_np)
-            
-            u1_np = np.dot(f1_np, c_np) / safe_rho1[..., None]
-            u2_np = np.dot(f2_np, c_np) / safe_rho2[..., None]
-            u_np = (rho1_np[..., None] * u1_np + rho2_np[..., None] * u2_np) / safe_rho_tot[..., None]
-            
+            f_np, g_np, h_np, solid_np = [np.array(x) for x in state]
             T_np = np.sum(g_np, axis=-1)
             C_np = np.sum(h_np, axis=-1)
+            rho_np = np.sum(f_np, axis=-1)
+            u_np = np.dot(f_np, c_np) / rho_np[..., None]
             
             binary_precipitate = np.where(solid_np > 0.1, 1.0, 0.0).astype(np.float32)
             fluid_mask_current = mask_cpu & (solid_np < 0.5)
@@ -439,10 +306,10 @@ def run_simulation():
             save_vti_file(f"outputs/vti/precipitate_growth_t{current_step}.vti", binary_precipitate, "CuSO4_Solid")
             save_vti_file(f"outputs/vti/velocity_evolution_t{current_step}.vti", u_np, "Velocity", is_vector=True)
             save_vti_file(f"outputs/vti/supersaturation_map_t{current_step}.vti", supersat_map, "Supersaturation")
-            save_vti_file(f"outputs/vti/cuso4_phase_t{current_step}.vti", rho1_np / safe_rho_tot, "CuSO4_Phase")
 
-            P_in = np.mean(rho_tot_np[0][circular_mask_np]) / 3.0
-            P_out = np.mean(rho_tot_np[-1][circular_mask_np]) / 3.0
+            # อ่านค่า Pressure เฉพาะตำแหน่งทางออกและทางเข้าในวงกลม เพื่อความแม่นยำสูงขึ้น
+            P_in = np.mean(rho_np[0][circular_mask_np]) / 3.0
+            P_out = np.mean(rho_np[-1][circular_mask_np]) / 3.0
             delta_P = P_in - P_out
             mean_u = np.mean(u_np[..., 0]) 
             
@@ -479,12 +346,12 @@ def run_simulation():
 
             max_supersat = np.max(supersat_map[fluid_mask_current]) if np.any(fluid_mask_current) else 0.0
 
-            with open("outputs/global_kinetics.csv", "a", newline="") as f_csv1, \
-                 open("outputs/object_analysis.csv", "a", newline="") as f_csv2, \
-                 open("outputs/pore_clogging_stats.csv", "a", newline="") as f_csv3:
-                csv.writer(f_csv1).writerow([current_step, time_s, current_solid_vol_mm3, porosity, k_perm_darcy, avg_T])
-                csv.writer(f_csv2).writerow([current_step, num_features, avg_size, max_size, surface_area])
-                csv.writer(f_csv3).writerow([current_step, min_throat, tortuosity])
+            with open("outputs/global_kinetics.csv", "a", newline="") as f1, \
+                 open("outputs/object_analysis.csv", "a", newline="") as f2, \
+                 open("outputs/pore_clogging_stats.csv", "a", newline="") as f3:
+                csv.writer(f1).writerow([current_step, time_s, current_solid_vol_mm3, porosity, k_perm_darcy, avg_T])
+                csv.writer(f2).writerow([current_step, num_features, avg_size, max_size, surface_area])
+                csv.writer(f3).writerow([current_step, min_throat, tortuosity])
 
             print(f"Step {current_step}/{args.steps} | Time: {time_s:.2f} s | Porosity: {porosity:.4f} | Crystals: {num_features} | k: {k_perm_darcy:.2e} Darcy | Max Supersat: {max_supersat:.4f} | Crystal Vol: {current_solid_vol_mm3:.2e} mm3")
 
@@ -498,9 +365,6 @@ def run_simulation():
 
     return (vel_mag_t0, vel_mag_tfinal, pe_da_data, maps_data, mask_cpu, u_scale_mms)
 
-# (ละโค้ด generate_reaction_maps และ generate_analytical_plots ไว้ด้านล่าง สามารถใช้ชุดเดิมได้เลย)
-
-# --- ละโค้ด generate_reaction_maps และ generate_analytical_plots ไว้ด้านล่าง (ใช้โค้ดชุด v3 เดิมได้เลย) ---
 def generate_reaction_maps(maps_data, mask_np):
     print("\nGenerating Spatial Reaction Maps (XY, XZ, YZ, and Z-Projection)...")
     steps_saved = sorted(list(maps_data.keys()))
