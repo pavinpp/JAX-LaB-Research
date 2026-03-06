@@ -839,20 +839,12 @@ def generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms, out_d
     plt.figure(figsize=(8, 6))
     v0_valid = (vel_t0[vel_t0 > 1e-6] * u_scale_mms) if vel_t0 is not None else []
     vf_valid = (vel_tfinal[vel_tfinal > 1e-6] * u_scale_mms) if vel_tfinal is not None else []
-
-    # [FIX] Calculate a shared global maximum to ensure bin widths match perfectly
-    max_v = 0.0
-    if len(v0_valid) > 0: max_v = max(max_v, np.max(v0_valid))
-    if len(vf_valid) > 0: max_v = max(max_v, np.max(vf_valid))
-
-    # [FIX] Force both histograms to use the exact same 50 bins
-    shared_bins = np.linspace(0, max_v, 50)
-
+    
     if len(v0_valid) > 0:
-        plt.hist(v0_valid, bins=shared_bins, alpha=0.6, label='Initial (Pre-Clogging)', density=True, color='royalblue')
+        plt.hist(v0_valid, bins=50, alpha=0.6, label='Initial (Pre-Clogging)', density=True, color='royalblue')
     if len(vf_valid) > 0:
-        plt.hist(vf_valid, bins=shared_bins, alpha=0.6, label='Final (Clogged)', density=True, color='crimson')
-
+        plt.hist(vf_valid, bins=50, alpha=0.6, label='Final (Clogged)', density=True, color='crimson')
+        
     plt.title("Pore Velocity Distribution Shift", fontsize=14, fontweight='bold')
     plt.xlabel("Local Velocity Magnitude (mm/s)", fontsize=12)
     plt.ylabel("Probability Density", fontsize=12)
@@ -889,34 +881,27 @@ def generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms, out_d
 
     if pe_da_data is not None:
         Pe_vals, Da_vals = pe_da_data
-
-        # [FIX] Filter out extreme unphysical outliers (dead/clogged zones with u≈0)
-        valid_mask = (Pe_vals > 1e-6) & (Da_vals < 1e6) & (Da_vals > 1e-6)
+        valid_mask = (Pe_vals > 0) & (Da_vals > 0)
         Pe_valid = Pe_vals[valid_mask]
         Da_valid = Da_vals[valid_mask]
-
+        
         plt.figure(figsize=(8, 6))
         num_points = min(5000, len(Pe_valid))
         if num_points > 0:
             idx = np.random.choice(len(Pe_valid), num_points, replace=False)
             plt.scatter(Da_valid[idx], Pe_valid[idx], alpha=0.5, c='darkmagenta', s=15, edgecolors='none')
-
+            
         plt.xscale('log')
         plt.yscale('log')
-
-        # [FIX] Clamp axes so infinity/zero outliers don't squash the data into a dot
-        plt.xlim(left=1e-4, right=1e4)
-        plt.ylim(bottom=1e-4, top=1e4)
-
         plt.title("Local Transport Regime ($Pe$ vs $Da$)", fontsize=14, fontweight='bold')
         plt.xlabel("Damk\u00f6hler Number ($Da$) - Reaction Dominance", fontsize=12)
         plt.ylabel("P\u00e9clet Number ($Pe$) - Advection Dominance", fontsize=12)
         plt.grid(True, which="both", ls="--", alpha=0.5)
-
+        
         plt.axhline(y=1, color='k', linestyle='-', alpha=0.8)
         plt.axvline(x=1, color='k', linestyle='-', alpha=0.8)
-        plt.text(1e-3, 1e1, 'Advection-Limited', fontsize=11, color='darkgreen', fontweight='bold')
-        plt.text(1e1, 1e-3, 'Reaction-Limited', fontsize=11, color='darkred', fontweight='bold')
+        plt.text(0.01, 10, 'Advection-Limited', fontsize=11, color='darkgreen', fontweight='bold')
+        plt.text(10, 0.01, 'Reaction-Limited', fontsize=11, color='darkred', fontweight='bold')
         plt.savefig(f"{out_dir}/analytics/transport_regime_da_pe.png", dpi=300, bbox_inches='tight')
         plt.close()
 
