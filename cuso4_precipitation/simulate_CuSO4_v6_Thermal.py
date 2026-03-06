@@ -11,11 +11,10 @@ from jax.tree import map as jax_map
 import csv
 import os
 import sys
-import datetime
 import scipy.ndimage as ndimage
 import pyvista as pv
 
-sys.path.append(os.path.abspath("../../"))
+sys.path.append(os.path.abspath("../"))
 
 from src.lattice import LatticeD3Q19
 from src.physics.crystallization import compute_heterogeneous_precipitation, calculate_equilibrium_concentration
@@ -545,58 +544,12 @@ def run_simulation():
         # u_eq is returned so the outer loop can pass it to thermal_solver.step()
         return f_tree_out, h_str, solid_frac, u_eq
 
-    # สร้าง Timestamp Folder เช่น "outputs/run_20261025_143000"
-    timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = f"outputs/run_{timestamp_str}"
-
-    os.makedirs(f"{out_dir}/vti", exist_ok=True)
-    os.makedirs(f"{out_dir}/analytics", exist_ok=True)
-   
-    # ----------------------------------------------------
-    # [NEW] สร้างไฟล์ run_summary.txt เพื่อเก็บ Parameters
-    # ----------------------------------------------------
-    summary_path = os.path.join(out_dir, "run_summary.txt")
-    with open(summary_path, "w", encoding="utf-8") as f_sum:
-        f_sum.write("=================================================\n")
-        f_sum.write("      JAX-LaB CuSO4 Simulation Run Summary       \n")
-        f_sum.write("=================================================\n")
-        f_sum.write(f"Run Timestamp : {timestamp_str}\n")
-        f_sum.write(f"Output Folder : {out_dir}\n\n")
-        
-        f_sum.write("--- 1. User Input Arguments ---\n")
-        f_sum.write(f"Geometry File      : {args.geom}\n")
-        f_sum.write(f"Flow Axis          : {args.axis}\n")
-        f_sum.write(f"Flow Rate          : {args.flow_rate} mL/hr\n")
-        f_sum.write(f"Voxel Size (dx)    : {args.dx_um} um\n")
-        f_sum.write(f"Total LBM Steps    : {args.steps}\n")
-        f_sum.write(f"Injection Size     : {args.inject_size}^3\n\n")
-        
-        f_sum.write("--- 2. Physical & LBM Scales ---\n")
-        f_sum.write(f"Domain Grid Size   : {mask.shape[0]} x {mask.shape[1]} x {mask.shape[2]}\n")
-        f_sum.write(f"Time Step (dt)     : {dt_s:.6e} s\n")
-        f_sum.write(f"Physical Inlet Vel : {u_phys_inlet * 1000:.4f} mm/s\n")
-        f_sum.write(f"LBM Inlet Vel (u)  : {u_lb:.6f}\n")
-        f_sum.write(f"Kinematic Visc(nu) : {nu_phys:.2e} m^2/s\n\n")
-        
-        f_sum.write("--- 3. Thermodynamics & Kinetics ---\n")
-        f_sum.write(f"Inlet Temp (T_hot) : {75.0} C\n")
-        f_sum.write(f"Wall Temp (T_cold) : {25.0} C\n")
-        # หากคุณมีตัวแปร eta_cht ในสคริปต์ ให้ใส่ด้วย
-        # f_sum.write(f"Heat Transfer (eta): {eta_cht}\n") 
-        f_sum.write(f"Inlet Conc (C_in)  : 60.0 g/100mL\n")
-        f_sum.write(f"Reaction Rate (k_r): {k_r}\n\n")
-        
-        f_sum.write("--- 4. LBM Relaxation Parameters ---\n")
-        f_sum.write(f"Fluid (tau_f_ref)  : {tau_f_ref}\n")
-        f_sum.write(f"Thermal (tau_t)    : {tau_t}\n")
-        f_sum.write(f"Solute (tau_c)     : {tau_c}\n")
-        f_sum.write("=================================================\n")
-        
-    print(f"\n[INFO] Simulation parameters saved to: {summary_path}\n")
-
-    with open(f"{out_dir}/global_kinetics.csv", "w", newline="") as f_csv1, \
-         open(f"{out_dir}/object_analysis.csv", "w", newline="") as f_csv2, \
-         open(f"{out_dir}/pore_clogging_stats.csv", "w", newline="") as f_csv3:
+    os.makedirs("outputs/vti", exist_ok=True)
+    os.makedirs("outputs/analytics", exist_ok=True)
+    
+    with open("outputs/global_kinetics.csv", "w", newline="") as f_csv1, \
+         open("outputs/object_analysis.csv", "w", newline="") as f_csv2, \
+         open("outputs/pore_clogging_stats.csv", "w", newline="") as f_csv3:
         csv.writer(f_csv1).writerow(["Step", "Time_s", "Total_Solid_Volume_mm3", "Porosity", "Global_Permeability_Darcy", "Avg_Temperature"])
         csv.writer(f_csv2).writerow(["Step", "Number_of_Crystals", "Avg_Crystal_Size", "Max_Crystal_Size", "Surface_Area"])
         csv.writer(f_csv3).writerow(["Step", "Min_Throat_Size", "Tortuosity_Index"])
@@ -655,10 +608,10 @@ def run_simulation():
                 'Z_proj': {'solid_sum': np.sum(solid_np, axis=2).copy()}
             }
 
-            save_vti_file(f"{out_dir}/vti/precipitate_growth_t{current_step}.vti", binary_precipitate, "CuSO4_Solid")
-            save_vti_file(f"{out_dir}/vti/velocity_evolution_t{current_step}.vti", u_np, "Velocity", is_vector=True)
-            save_vti_file(f"{out_dir}/vti/supersaturation_map_t{current_step}.vti", supersat_map, "Supersaturation")
-            save_vti_file(f"{out_dir}/vti/cuso4_phase_t{current_step}.vti", rho1_np / safe_rho_tot, "CuSO4_Phase")
+            save_vti_file(f"outputs/vti/precipitate_growth_t{current_step}.vti", binary_precipitate, "CuSO4_Solid")
+            save_vti_file(f"outputs/vti/velocity_evolution_t{current_step}.vti", u_np, "Velocity", is_vector=True)
+            save_vti_file(f"outputs/vti/supersaturation_map_t{current_step}.vti", supersat_map, "Supersaturation")
+            save_vti_file(f"outputs/vti/cuso4_phase_t{current_step}.vti", rho1_np / safe_rho_tot, "CuSO4_Phase")
 
             P_in = np.mean(rho_tot_np[0][circular_mask_np]) / 3.0
             P_out = np.mean(rho_tot_np[-1][circular_mask_np]) / 3.0
@@ -703,9 +656,9 @@ def run_simulation():
             from src.physics.stability_utils import log_pseudopotential_stability
             log_pseudopotential_stability(rho_tree_diag, pr_eos, current_step, fluid_mask=mask_cpu)
 
-            with open(f"{out_dir}/global_kinetics.csv", "a", newline="") as f_csv1, \
-                 open(f"{out_dir}/object_analysis.csv", "a", newline="") as f_csv2, \
-                 open(f"{out_dir}/pore_clogging_stats.csv", "a", newline="") as f_csv3:
+            with open("outputs/global_kinetics.csv", "a", newline="") as f_csv1, \
+                 open("outputs/object_analysis.csv", "a", newline="") as f_csv2, \
+                 open("outputs/pore_clogging_stats.csv", "a", newline="") as f_csv3:
                 csv.writer(f_csv1).writerow([current_step, time_s, current_solid_vol_mm3, porosity, k_perm_darcy, avg_T])
                 csv.writer(f_csv2).writerow([current_step, num_features, avg_size, max_size, surface_area])
                 csv.writer(f_csv3).writerow([current_step, min_throat, tortuosity])
@@ -733,10 +686,11 @@ def run_simulation():
     Da_map = (k_r * L_ref) / u_mag_safe
     pe_da_data = (Pe_map[fluid_mask_current], Da_map[fluid_mask_current])
 
-    return (vel_mag_t0, vel_mag_tfinal, pe_da_data, maps_data, mask_cpu, u_scale_mms, out_dir)
+    return (vel_mag_t0, vel_mag_tfinal, pe_da_data, maps_data, mask_cpu, u_scale_mms)
 
-def generate_reaction_maps(maps_data, mask_np, out_dir):
-    print(f"\nGenerating Spatial Reaction Maps in {out_dir}/analytics ...")
+# --- ละโค้ด generate_reaction_maps และ generate_analytical_plots ไว้ด้านล่าง (ใช้โค้ดชุด v3 เดิมได้เลย) ---
+def generate_reaction_maps(maps_data, mask_np):
+    print("\nGenerating Spatial Reaction Maps (XY, XZ, YZ, and Z-Projection)...")
     steps_saved = sorted(list(maps_data.keys()))
     
     if len(steps_saved) >= 3:
@@ -762,32 +716,27 @@ def generate_reaction_maps(maps_data, mask_np, out_dir):
             C_slice = maps_data[step][plane_name]['C'].astype(float)
             solid_slice = maps_data[step][plane_name]['solid'].astype(float)
             
-            # Masking non-fluid nodes for visualization
             T_slice[~mask_slice] = np.nan
             C_slice[~mask_slice] = np.nan
             solid_slice[~mask_slice] = np.nan
             
-            # 1. Temperature Map (25°C to 75°C)
             im0 = axes[row_idx, 0].imshow(T_slice.T, cmap='inferno', origin='lower', vmin=25, vmax=75)
             axes[row_idx, 0].set_title(f'Step {step}: Temp (°C)')
             fig.colorbar(im0, ax=axes[row_idx, 0], fraction=0.046, pad=0.04)
             
-            # 2. Concentration Map (0 to 65 g/100mL)
-            im1 = axes[row_idx, 1].imshow(C_slice.T, cmap='viridis', origin='lower', vmin=0, vmax=65.0)
-            axes[row_idx, 1].set_title(f'Step {step}: CuSO\u2084 Conc. (g/100mL)')
+            im1 = axes[row_idx, 1].imshow(C_slice.T, cmap='viridis', origin='lower', vmin=0, vmax=1.0)
+            axes[row_idx, 1].set_title(f'Step {step}: CuSO4 Conc.')
             fig.colorbar(im1, ax=axes[row_idx, 1], fraction=0.046, pad=0.04)
             
-            # 3. Solid Fraction Map
-            im2 = axes[row_idx, 2].imshow(solid_slice.T, cmap='YlGnBu', origin='lower', vmin=0, vmax=1.0)
-            axes[row_idx, 2].set_title(f'Step {step}: Crystal Vol Fraction')
+            im2 = axes[row_idx, 2].imshow(solid_slice.T, cmap='cool', origin='lower')
+            axes[row_idx, 2].set_title(f'Step {step}: Crystal Vol')
             fig.colorbar(im2, ax=axes[row_idx, 2], fraction=0.046, pad=0.04)
             
-        fig.suptitle(f"Reactive Transport Evolution: {plane_info['title']}", fontsize=18, fontweight='bold')
+        fig.suptitle(f"Reactive Transport Evolution: {plane_info['title']}", fontsize=20)
         fig.tight_layout()
-        fig.savefig(f"{out_dir}/analytics/cuso4_reaction_maps_{plane_name}.png", dpi=300, bbox_inches='tight')
+        fig.savefig(f"outputs/analytics/cuso4_reaction_maps_{plane_name}.png", dpi=300, bbox_inches='tight')
         plt.close()
 
-    # Z-Projection Map
     fig_proj, axes_proj = plt.subplots(1, len(steps_to_plot), figsize=(6 * len(steps_to_plot), 5))
     if len(steps_to_plot) == 1: axes_proj = [axes_proj]
 
@@ -798,22 +747,22 @@ def generate_reaction_maps(maps_data, mask_np, out_dir):
         solid_sum = maps_data[step]['Z_proj']['solid_sum'].astype(float)
         solid_sum[np.isnan(pore_depth)] = np.nan 
 
-        im = axes_proj[col_idx].imshow(solid_sum.T, cmap='cividis', origin='lower')
+        im = axes_proj[col_idx].imshow(solid_sum.T, cmap='magma', origin='lower')
         axes_proj[col_idx].set_title(f'Step {step}: Total Crystal Depth')
         fig_proj.colorbar(im, ax=axes_proj[col_idx], fraction=0.046, pad=0.04)
 
-    fig_proj.suptitle("Z-Projection (Top-down Sum of Crystal Volume)", fontsize=18, fontweight='bold')
+    fig_proj.suptitle("Z-Projection (Top-down Sum of Crystal Volume)", fontsize=20)
     fig_proj.tight_layout()
-    fig_proj.savefig(f"{out_dir}/analytics/cuso4_reaction_maps_Z_projection.png", dpi=300, bbox_inches='tight')
+    fig_proj.savefig("outputs/analytics/cuso4_reaction_maps_Z_projection.png", dpi=300, bbox_inches='tight')
     plt.close()
     print("  -> Saved Z-Projection Map")
 
-def generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms, out_dir):
-    print(f"Generating Analytical PNG Plots in {out_dir}/analytics ...")
+def generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms):
+    print("Generating Analytical PNG Plots (Physical Units)...")
+    os.makedirs("outputs/analytics", exist_ok=True)
     
-    # Load CSVs from the specific timestamped directory
-    kinetics = np.genfromtxt(f"{out_dir}/global_kinetics.csv", delimiter=',', skip_header=1)
-    objects = np.genfromtxt(f"{out_dir}/object_analysis.csv", delimiter=',', skip_header=1)
+    kinetics = np.genfromtxt("outputs/global_kinetics.csv", delimiter=',', skip_header=1)
+    objects = np.genfromtxt("outputs/object_analysis.csv", delimiter=',', skip_header=1)
     
     if kinetics.ndim > 1:
         time_s = kinetics[:, 1]
@@ -828,12 +777,12 @@ def generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms, out_d
         else:
             plt.plot(time_s, k_mag, 'b-o', linewidth=2)
             
-        plt.title("Absolute Permeability Reduction", fontsize=14, fontweight='bold')
-        plt.xlabel("Time (Seconds)", fontsize=12)
-        plt.ylabel("Permeability (Darcy)", fontsize=12)
+        plt.title("Absolute Permeability Reduction")
+        plt.xlabel("Time (Seconds)")
+        plt.ylabel("Permeability (Darcy)")
         plt.yscale('log') 
         plt.grid(True, which="both", ls="--", alpha=0.5)
-        plt.savefig(f"{out_dir}/analytics/permeability_reduction.png", dpi=300, bbox_inches='tight')
+        plt.savefig("outputs/analytics/permeability_reduction.png", dpi=300, bbox_inches='tight')
         plt.close()
 
     plt.figure(figsize=(8, 6))
@@ -841,16 +790,16 @@ def generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms, out_d
     vf_valid = (vel_tfinal[vel_tfinal > 1e-6] * u_scale_mms) if vel_tfinal is not None else []
     
     if len(v0_valid) > 0:
-        plt.hist(v0_valid, bins=50, alpha=0.6, label='Initial (Pre-Clogging)', density=True, color='royalblue')
+        plt.hist(v0_valid, bins=50, alpha=0.5, label='Initial', density=True, color='blue')
     if len(vf_valid) > 0:
-        plt.hist(vf_valid, bins=50, alpha=0.6, label='Final (Clogged)', density=True, color='crimson')
+        plt.hist(vf_valid, bins=50, alpha=0.5, label='Clogged', density=True, color='red')
         
-    plt.title("Pore Velocity Distribution Shift", fontsize=14, fontweight='bold')
-    plt.xlabel("Local Velocity Magnitude (mm/s)", fontsize=12)
-    plt.ylabel("Probability Density", fontsize=12)
-    plt.legend(fontsize=11)
-    plt.grid(True, ls=":", alpha=0.7)
-    plt.savefig(f"{out_dir}/analytics/velocity_distribution_shift.png", dpi=300, bbox_inches='tight')
+    plt.title("Pore Velocity Distribution Shift")
+    plt.xlabel("Local Velocity Magnitude (mm/s)")
+    plt.ylabel("Probability Density")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("outputs/analytics/velocity_distribution_shift.png", dpi=300, bbox_inches='tight')
     plt.close()
 
     if objects.ndim > 1 and kinetics.ndim > 1:
@@ -862,21 +811,21 @@ def generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms, out_d
         
         fig, ax1 = plt.subplots(figsize=(8, 6))
         
-        color1 = 'crimson'
-        ax1.set_xlabel('Time (Seconds)', fontsize=12)
-        ax1.set_ylabel('Total Precipitation Volume ($mm^3$)', color=color1, fontsize=12)
+        color1 = 'tab:red'
+        ax1.set_xlabel('Time (Seconds)')
+        ax1.set_ylabel('Total Precipitation Volume ($mm^3$)', color=color1)
         ax1.plot(time_s, vol_mm3, color=color1, linewidth=2, marker='s', label='Volume')
         ax1.tick_params(axis='y', labelcolor=color1)
 
         ax2 = ax1.twinx()  
-        color2 = 'teal'
-        ax2.set_ylabel('Surface Area / Volume Ratio (SA/V)', color=color2, fontsize=12)  
+        color2 = 'tab:blue'
+        ax2.set_ylabel('Surface Area / Volume Ratio (SA/V)', color=color2)  
         ax2.plot(time_s, sa_v_ratio, color=color2, linewidth=2, marker='o', label='SA/V Ratio')
         ax2.tick_params(axis='y', labelcolor=color2)
 
-        plt.title("Morphology Trajectory: Patchy vs Layer-like Growth", fontsize=14, fontweight='bold')
+        plt.title("Morphology Trajectory: Patchy vs Layer-like Growth")
         fig.tight_layout()  
-        plt.savefig(f"{out_dir}/analytics/morphology_trajectory.png", dpi=300, bbox_inches='tight')
+        plt.savefig("outputs/analytics/morphology_trajectory.png", dpi=300, bbox_inches='tight')
         plt.close()
 
     if pe_da_data is not None:
@@ -889,20 +838,20 @@ def generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms, out_d
         num_points = min(5000, len(Pe_valid))
         if num_points > 0:
             idx = np.random.choice(len(Pe_valid), num_points, replace=False)
-            plt.scatter(Da_valid[idx], Pe_valid[idx], alpha=0.5, c='darkmagenta', s=15, edgecolors='none')
+            plt.scatter(Da_valid[idx], Pe_valid[idx], alpha=0.4, c='purple', s=15, edgecolors='none')
             
         plt.xscale('log')
         plt.yscale('log')
-        plt.title("Local Transport Regime ($Pe$ vs $Da$)", fontsize=14, fontweight='bold')
-        plt.xlabel("Damk\u00f6hler Number ($Da$) - Reaction Dominance", fontsize=12)
-        plt.ylabel("P\u00e9clet Number ($Pe$) - Advection Dominance", fontsize=12)
+        plt.title("Local Transport Regime ($Pe$ vs $Da$)")
+        plt.xlabel("Damköhler Number ($Da$) - Reaction Dominance")
+        plt.ylabel("Péclet Number ($Pe$) - Advection Dominance")
         plt.grid(True, which="both", ls="--", alpha=0.5)
         
         plt.axhline(y=1, color='k', linestyle='-', alpha=0.8)
         plt.axvline(x=1, color='k', linestyle='-', alpha=0.8)
-        plt.text(0.01, 10, 'Advection-Limited', fontsize=11, color='darkgreen', fontweight='bold')
-        plt.text(10, 0.01, 'Reaction-Limited', fontsize=11, color='darkred', fontweight='bold')
-        plt.savefig(f"{out_dir}/analytics/transport_regime_da_pe.png", dpi=300, bbox_inches='tight')
+        plt.text(0.01, 10, 'Advection-Limited', fontsize=10, color='darkgreen')
+        plt.text(10, 0.01, 'Reaction-Limited', fontsize=10, color='darkred')
+        plt.savefig("outputs/analytics/transport_regime_da_pe.png", dpi=300, bbox_inches='tight')
         plt.close()
 
     if objects.ndim > 1 and kinetics.ndim > 1:
@@ -912,26 +861,26 @@ def generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms, out_d
         
         fig, ax1 = plt.subplots(figsize=(8, 6))
         
-        color1 = 'forestgreen'
-        ax1.set_xlabel('Time (Seconds)', fontsize=12)
-        ax1.set_ylabel('Number of Crystals (Nucleation Sites)', color=color1, fontsize=12)
+        color1 = 'tab:green'
+        ax1.set_xlabel('Time (Seconds)')
+        ax1.set_ylabel('Number of Crystals (Nucleation Sites)', color=color1)
         ax1.plot(time_s, num_crystals, color=color1, linewidth=2, marker='^', label='Crystal Count')
         ax1.tick_params(axis='y', labelcolor=color1)
 
         ax2 = ax1.twinx()  
-        color2 = 'crimson'
-        ax2.set_ylabel('Total Precipitation Volume ($mm^3$)', color=color2, fontsize=12)  
+        color2 = 'tab:red'
+        ax2.set_ylabel('Total Precipitation Volume ($mm^3$)', color=color2)  
         ax2.plot(time_s, vol_mm3, color=color2, linewidth=2, marker='s', label='Volume')
         ax2.tick_params(axis='y', labelcolor=color2)
 
-        plt.title("Nucleation Saturation: Crystal Count & Volume vs Time", fontsize=14, fontweight='bold')
+        plt.title("Nucleation Saturation: Crystal Count & Volume vs Time")
         fig.tight_layout()  
-        plt.savefig(f"{out_dir}/analytics/nucleation_saturation.png", dpi=300, bbox_inches='tight')
+        plt.savefig("outputs/analytics/nucleation_saturation.png", dpi=300, bbox_inches='tight')
         plt.close()
         
-    print("All analytical PNGs exported successfully!")
+    print("All analytical PNGs (Physical Units) exported successfully!")
 
 if __name__ == "__main__":
-    vel_t0, vel_tfinal, pe_da_data, maps_data, mask_np, u_scale_mms, out_dir = run_simulation()
-    generate_reaction_maps(maps_data, mask_np, out_dir)
-    generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms, out_dir)
+    vel_t0, vel_tfinal, pe_da_data, maps_data, mask_np, u_scale_mms = run_simulation()
+    generate_reaction_maps(maps_data, mask_np)
+    generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms)

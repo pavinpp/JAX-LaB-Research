@@ -10,7 +10,7 @@ import sys
 import scipy.ndimage as ndimage
 import pyvista as pv
 
-sys.path.append(os.path.abspath("../../"))
+sys.path.append(os.path.abspath("../"))
 
 from src.lattice import LatticeD3Q19
 from src.physics.crystallization import compute_heterogeneous_precipitation, calculate_equilibrium_concentration
@@ -61,6 +61,22 @@ def run_simulation():
     
     mask = jnp.array(mask_np_full[xs:xe, ys:ye, zs:ze])
     
+    # =======================================================
+    # สร้าง Circular Mask สำหรับ Inlet และ Outlet
+    # =======================================================
+    ny, nz = mask.shape[1], mask.shape[2]
+    Y, Z = np.meshgrid(np.arange(ny), np.arange(nz), indexing='ij')
+    
+    # เส้นผ่านศูนย์กลาง 60 -> รัศมี 30
+    radius = 30.0 
+    # วาง Center แกน Y ให้อยู่ตรงกลาง และ Center แกน Z อยู่ที่ระยะเท่ากับรัศมี 
+    # เพื่อให้ขอบล่างของวงกลมแตะพื้น Z=0 (Continuous with bottom of porous media)
+    cy, cz = ny / 2.0, radius 
+    
+    r_sq = (Y - cy)**2 + (Z - cz)**2
+    circular_mask_np = r_sq <= radius**2
+    circular_mask = jnp.array(circular_mask_np) # JAX array สำหรับการรันแบบ JIT
+    
     lattice = LatticeD3Q19()
     c_int = np.array(lattice.c, dtype=int).T.tolist()   
     c = jnp.array(lattice.c, dtype=jnp.float32).T       
@@ -79,7 +95,9 @@ def run_simulation():
     dt_s = (nu_lb * (dx_m ** 2)) / nu_phys 
     
     Q_m3s = args.flow_rate / 3.6e9  
-    cross_section_area_m2 = (mask.shape[1] * mask.shape[2]) * (dx_m ** 2)
+    
+    # แก้ไขพื้นที่หน้าตัดให้คำนวณจากวงกลม ไม่ใช่สี่เหลี่ยมเต็มแผ่น
+    cross_section_area_m2 = float(np.sum(circular_mask_np)) * (dx_m ** 2)
     u_phys_inlet = Q_m3s / cross_section_area_m2 
     u_lb = u_phys_inlet * (dt_s / dx_m)          
     
@@ -137,10 +155,11 @@ def run_simulation():
         target_u_dynamic = jnp.zeros(3).at[0].set(current_u_lb)
         
         if args.axis == 'X':
-            u = u.at[0, :, :, :].set(target_u_dynamic)
-            rho = rho.at[0, :, :].set(1.0)
-            T = T.at[0, :, :].set(T_hot)
-            C = C.at[0, :, :].set(C_inlet)
+            # ฉีดความเร็วและมวลเฉพาะบริเวณที่เป็นวงกลมเท่านั้น (Circular Mask)
+            u = u.at[0].set(jnp.where(circular_mask[..., None], target_u_dynamic, u[0]))
+            rho = rho.at[0].set(jnp.where(circular_mask, 1.0, rho[0]))
+            T = T.at[0].set(jnp.where(circular_mask, T_hot, T[0]))
+            C = C.at[0].set(jnp.where(circular_mask, C_inlet, C[0]))
             
         tau_f_local = calculate_tau_f(T, tau_ref=tau_f_ref)
         omega_f_local = 1.0 / tau_f_local
@@ -151,11 +170,16 @@ def run_simulation():
         
         effective_fluid_mask = mask & (solid_frac < 0.5)
         wall_mask = jnp.zeros_like(effective_fluid_mask, dtype=bool)
+        
         if args.axis == 'X':
             wall_mask = wall_mask.at[:, 0, :].set(True)
             wall_mask = wall_mask.at[:, -1, :].set(True)
             wall_mask = wall_mask.at[:, :, 0].set(True)
             wall_mask = wall_mask.at[:, :, -1].set(True)
+            
+            # ปิดพื้นที่สี่เหลี่ยมรอบๆ วงกลมให้กลายเป็นกำแพงกันน้ำ (Bounce-back)
+            wall_mask = wall_mask.at[0, :, :].set(wall_mask[0, :, :] | ~circular_mask)
+            wall_mask = wall_mask.at[-1, :, :].set(wall_mask[-1, :, :] | ~circular_mask)
             
         effective_fluid_mask_bc = effective_fluid_mask & (~wall_mask)
         delta_C = compute_heterogeneous_precipitation(C, T, k_r, effective_fluid_mask_bc, c_int)
@@ -182,13 +206,18 @@ def run_simulation():
         
         if args.axis == 'X':
             u_in = jnp.zeros_like(u[0]).at[..., 0].set(current_u_lb)
-            f_str = f_str.at[0, :, :, :].set(calc_equilibrium(jnp.ones_like(rho[0]), u_in))
-            g_str = g_str.at[0, :, :, :].set(calc_equilibrium(jnp.ones_like(T[0]) * T_hot, u_in))
-            h_str = h_str.at[0, :, :, :].set(calc_equilibrium(jnp.ones_like(C[0]) * C_inlet, u_in))
+            f_eq_in = calc_equilibrium(jnp.ones_like(rho[0]), u_in)
+            g_eq_in = calc_equilibrium(jnp.ones_like(T[0]) * T_hot, u_in)
+            h_eq_in = calc_equilibrium(jnp.ones_like(C[0]) * C_inlet, u_in)
             
-            f_str = f_str.at[-1, :, :, :].set(f_str[-2, :, :, :])
-            g_str = g_str.at[-1, :, :, :].set(g_str[-2, :, :, :])
-            h_str = h_str.at[-1, :, :, :].set(h_str[-2, :, :, :])
+            # บังคับการฉีดและไหลออกเฉพาะหน้าตัดวงกลมเท่านั้น (นอกวงกลมจะชนกำแพงเด้งกลับอัตโนมัติ)
+            f_str = f_str.at[0].set(jnp.where(circular_mask[..., None], f_eq_in, f_str[0]))
+            g_str = g_str.at[0].set(jnp.where(circular_mask[..., None], g_eq_in, g_str[0]))
+            h_str = h_str.at[0].set(jnp.where(circular_mask[..., None], h_eq_in, h_str[0]))
+            
+            f_str = f_str.at[-1].set(jnp.where(circular_mask[..., None], f_str[-2], f_str[-1]))
+            g_str = g_str.at[-1].set(jnp.where(circular_mask[..., None], g_str[-2], g_str[-1]))
+            h_str = h_str.at[-1].set(jnp.where(circular_mask[..., None], h_str[-2], h_str[-1]))
 
         return (f_str, g_str, h_str, solid_frac), None
 
@@ -247,7 +276,6 @@ def run_simulation():
             if current_step == 0:
                 vel_mag_t0 = u_mag[fluid_mask_current]
 
-            # --- เพิ่ม Z_proj (Sum ตามแกน Z) เพื่อทำ Top-Down Projection ---
             maps_data[current_step] = {
                 'XY': {'T': T_np[:, :, mid_z].copy(), 'C': C_np[:, :, mid_z].copy(), 'solid': solid_np[:, :, mid_z].copy()},
                 'XZ': {'T': T_np[:, mid_y, :].copy(), 'C': C_np[:, mid_y, :].copy(), 'solid': solid_np[:, mid_y, :].copy()},
@@ -259,7 +287,10 @@ def run_simulation():
             save_vti_file(f"outputs/vti/velocity_evolution_t{current_step}.vti", u_np, "Velocity", is_vector=True)
             save_vti_file(f"outputs/vti/supersaturation_map_t{current_step}.vti", supersat_map, "Supersaturation")
 
-            delta_P = (np.mean(rho_np[0, :, :]) - np.mean(rho_np[-1, :, :])) / 3.0
+            # อ่านค่า Pressure เฉพาะตำแหน่งทางออกและทางเข้าในวงกลม เพื่อความแม่นยำสูงขึ้น
+            P_in = np.mean(rho_np[0][circular_mask_np]) / 3.0
+            P_out = np.mean(rho_np[-1][circular_mask_np]) / 3.0
+            delta_P = P_in - P_out
             mean_u = np.mean(u_np[..., 0]) 
             
             avg_T = np.mean(T_np)
@@ -325,9 +356,6 @@ def generate_reaction_maps(maps_data, mask_np):
         
     mid_x, mid_y, mid_z = mask_np.shape[0]//2, mask_np.shape[1]//2, mask_np.shape[2]//2
     
-    # ---------------------------------------------------------
-    # 1. พล็อต Slices แบบปกติ (XY, XZ, YZ)
-    # ---------------------------------------------------------
     planes = {
         'XY': {'mask': mask_np[:, :, mid_z], 'title': 'X-Y Cross Section (Mid-Z)'},
         'XZ': {'mask': mask_np[:, mid_y, :], 'title': 'X-Z Cross Section (Mid-Y)'},
@@ -365,23 +393,16 @@ def generate_reaction_maps(maps_data, mask_np):
         fig.savefig(f"outputs/analytics/cuso4_reaction_maps_{plane_name}.png", dpi=300, bbox_inches='tight')
         plt.close()
 
-    # ---------------------------------------------------------
-    # 2. พล็อต Z-Projection (Top-Down Sum of Solid) ใหม่ล่าสุด!
-    # ---------------------------------------------------------
     fig_proj, axes_proj = plt.subplots(1, len(steps_to_plot), figsize=(6 * len(steps_to_plot), 5))
     if len(steps_to_plot) == 1: axes_proj = [axes_proj]
 
-    # คำนวณหาช่องว่างรูพรุนทั้งหมดในแนวแกน Z เพื่อใช้บังส่วนที่เป็นก้อนหินทึบตัน
     pore_depth = np.sum(mask_np, axis=2).astype(float)
     pore_depth[pore_depth == 0] = np.nan 
 
     for col_idx, step in enumerate(steps_to_plot):
         solid_sum = maps_data[step]['Z_proj']['solid_sum'].astype(float)
-        
-        # ถ้าระนาบ Z ตรงนั้นไม่มีช่องว่างเลย (เป็นหินล้วน) ให้ซ่อนสีไป (กลายเป็นพื้นหลังขาว/เทา)
         solid_sum[np.isnan(pore_depth)] = np.nan 
 
-        # พล็อตค่า Sum ลงไป (ใช้สี magma เพื่อเน้นจุดที่มีคริสตัลทับซ้อนกันหนาแน่น)
         im = axes_proj[col_idx].imshow(solid_sum.T, cmap='magma', origin='lower')
         axes_proj[col_idx].set_title(f'Step {step}: Total Crystal Depth')
         fig_proj.colorbar(im, ax=axes_proj[col_idx], fraction=0.046, pad=0.04)
@@ -399,7 +420,6 @@ def generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms):
     kinetics = np.genfromtxt("outputs/global_kinetics.csv", delimiter=',', skip_header=1)
     objects = np.genfromtxt("outputs/object_analysis.csv", delimiter=',', skip_header=1)
     
-    # 1. Permeability Reduction 
     if kinetics.ndim > 1:
         time_s = kinetics[:, 1]
         permeability = kinetics[:, 4]
@@ -421,7 +441,6 @@ def generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms):
         plt.savefig("outputs/analytics/permeability_reduction.png", dpi=300, bbox_inches='tight')
         plt.close()
 
-    # 2. Velocity Distribution Shift 
     plt.figure(figsize=(8, 6))
     v0_valid = (vel_t0[vel_t0 > 1e-6] * u_scale_mms) if vel_t0 is not None else []
     vf_valid = (vel_tfinal[vel_tfinal > 1e-6] * u_scale_mms) if vel_tfinal is not None else []
@@ -439,7 +458,6 @@ def generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms):
     plt.savefig("outputs/analytics/velocity_distribution_shift.png", dpi=300, bbox_inches='tight')
     plt.close()
 
-    # 3. Morphology Trajectory 
     if objects.ndim > 1 and kinetics.ndim > 1:
         time_s = kinetics[:, 1]
         surface_area = objects[:, 4]
@@ -466,7 +484,6 @@ def generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms):
         plt.savefig("outputs/analytics/morphology_trajectory.png", dpi=300, bbox_inches='tight')
         plt.close()
 
-    # 4. Transport Regime (Pe vs Da) 
     if pe_da_data is not None:
         Pe_vals, Da_vals = pe_da_data
         valid_mask = (Pe_vals > 0) & (Da_vals > 0)
@@ -493,24 +510,19 @@ def generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms):
         plt.savefig("outputs/analytics/transport_regime_da_pe.png", dpi=300, bbox_inches='tight')
         plt.close()
 
-    # ---------------------------------------------------------
-    # 5. พล็อตกราฟใหม่ล่าสุด! Nucleation Saturation (Dual Y-Axis)
-    # ---------------------------------------------------------
     if objects.ndim > 1 and kinetics.ndim > 1:
         time_s = kinetics[:, 1]
-        num_crystals = objects[:, 1] # คอลัมน์ Number_of_Crystals
+        num_crystals = objects[:, 1] 
         vol_mm3 = kinetics[:, 2] 
         
         fig, ax1 = plt.subplots(figsize=(8, 6))
         
-        # แกนซ้าย: Number of Crystals (สีเขียว)
         color1 = 'tab:green'
         ax1.set_xlabel('Time (Seconds)')
         ax1.set_ylabel('Number of Crystals (Nucleation Sites)', color=color1)
         ax1.plot(time_s, num_crystals, color=color1, linewidth=2, marker='^', label='Crystal Count')
         ax1.tick_params(axis='y', labelcolor=color1)
 
-        # แกนขวา: Total Volume (สีแดง)
         ax2 = ax1.twinx()  
         color2 = 'tab:red'
         ax2.set_ylabel('Total Precipitation Volume ($mm^3$)', color=color2)  

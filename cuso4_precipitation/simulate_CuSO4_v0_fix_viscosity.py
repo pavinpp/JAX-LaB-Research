@@ -10,7 +10,7 @@ import sys
 import scipy.ndimage as ndimage
 import pyvista as pv
 
-sys.path.append(os.path.abspath("../../"))
+sys.path.append(os.path.abspath("../"))
 
 from src.lattice import LatticeD3Q19
 from src.physics.crystallization import compute_heterogeneous_precipitation, calculate_equilibrium_concentration

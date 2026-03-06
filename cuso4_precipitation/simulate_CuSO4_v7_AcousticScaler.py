@@ -11,10 +11,11 @@ from jax.tree import map as jax_map
 import csv
 import os
 import sys
+import datetime
 import scipy.ndimage as ndimage
 import pyvista as pv
 
-sys.path.append(os.path.abspath("../../"))
+sys.path.append(os.path.abspath("../"))
 
 from src.lattice import LatticeD3Q19
 from src.physics.crystallization import compute_heterogeneous_precipitation, calculate_equilibrium_concentration
@@ -38,6 +39,9 @@ def parse_ui_args():
     parser.add_argument("--dx_um", type=float, default=20.0, help="Voxel size in micrometers (um)")
     parser.add_argument("--steps", type=int, default=10000)
     parser.add_argument("--inject_size", type=int, default=60)
+    parser.add_argument("--t_phys", type=float, default=None,
+                        help="Total physical simulation time in seconds. "
+                             "If omitted, derived from --steps using a reference tau_f=1.0 dt.")
     return parser.parse_args()
 
 def save_vti_file(filename, array, name, is_vector=False):
@@ -59,6 +63,98 @@ def calculate_tau_f(T_celsius, tau_ref=1.0):
     mu_ref = 1.35 
     tau_f = 0.5 + (tau_ref - 0.5) * (mu_T / mu_ref)
     return tau_f
+
+
+# =========================================================================
+# Geometry-Aware Circular Port Acoustic Scaler
+# Guarantees u_lb ≤ target_ulb_max by deriving dt and n_steps from the
+# true bottleneck interstitial velocity at the injection face, then
+# recalibrates τ_f, τ_c, τ_t to preserve macroscopic ν, D, α exactly.
+# =========================================================================
+class CircularAcousticScaler:
+    """Derives a Mach-safe dt from the pore-scale bottleneck velocity.
+
+    Parameters
+    ----------
+    dx : float
+        Voxel size in metres.
+    target_ulb_max : float
+        Maximum allowed lattice velocity (default 0.02 for low-Mach stability).
+    cs2 : float
+        Lattice speed-of-sound squared (1/3 for standard D3Q19).
+    """
+    def __init__(self, dx: float, target_ulb_max: float = 0.02, cs2: float = 1.0 / 3.0):
+        self.dx = float(dx)
+        self.target_ulb_max = float(target_ulb_max)
+        self.cs2 = float(cs2)
+
+    def recalibrate(
+        self,
+        Q_ml_hr: float,
+        geometry_array: np.ndarray,
+        inject_radius_m: float,
+        nu_phys: float,
+        D_phys: float,
+        alpha_phys: float,
+        t_phys_total: float,
+    ):
+        """Compute Mach-safe dt, total LBM steps, and transport-invariant τ values.
+
+        Parameters
+        ----------
+        Q_ml_hr        : volumetric flow rate in mL/hr
+        geometry_array : boolean 3-D array, True = fluid
+        inject_radius_m: physical radius of the injection port in metres
+        nu_phys        : kinematic viscosity of the fluid (m^2/s)
+        D_phys         : solute mass diffusivity (m^2/s)
+        alpha_phys     : thermal diffusivity (m^2/s)
+        t_phys_total   : desired simulation duration in seconds
+        """
+        # 1. Convert flow rate to m^3/s
+        Q_m3_s = Q_ml_hr * (1e-6 / 3600.0)
+
+        # 2. Build circular mask for the inlet face (first x-plane)
+        inlet_slice = geometry_array[0, :, :]      # shape (Ny, Nz)
+        Ny, Nz = inlet_slice.shape
+        cy_c, cz_c = Ny // 2, Nz // 2
+        y_idx, z_idx = np.ogrid[:Ny, :Nz]
+        distance_m = np.sqrt((y_idx - cy_c) ** 2 + (z_idx - cz_c) ** 2) * self.dx
+        circular_mask = distance_m <= inject_radius_m
+
+        # 3. Effective open area: fluid nodes only inside the circular port
+        fluid_nodes_in_circle = inlet_slice & circular_mask
+        N_eff = int(np.sum(fluid_nodes_in_circle))
+        if N_eff == 0:
+            raise ValueError(
+                "CircularAcousticScaler: zero fluid nodes in the injection port. "
+                "Increase inject_size or check the geometry mask."
+            )
+        A_eff = N_eff * (self.dx ** 2)          # m^2
+
+        # 4. Maximum bottleneck interstitial velocity through fluid pores only
+        V_pore_max = Q_m3_s / A_eff             # m/s
+
+        # 5. Acoustic (diffusive) scaling: choose dt so u_lb = target_ulb_max exactly
+        dt = (self.target_ulb_max * self.dx) / V_pore_max
+        n_steps = int(np.ceil(t_phys_total / dt))
+
+        # 6. Transport-invariant relaxation recalibration
+        #    τ = 0.5 + (transport_coeff * dt) / (cs2 * dx^2)
+        tau_f = 0.5 + (nu_phys * dt)    / (self.cs2 * self.dx ** 2)
+        tau_c = 0.5 + (D_phys  * dt)    / (self.cs2 * self.dx ** 2)
+        tau_t = 0.5 + (alpha_phys * dt) / (self.cs2 * self.dx ** 2)
+
+        print("\n=== Circular Port Acoustic Scaling (Geometry-Aware) ===")
+        print(f"  Inject radius    : {inject_radius_m * 1e3:.3f} mm")
+        print(f"  Effective area   : {A_eff:.4e} m^2  ({N_eff} fluid nodes)")
+        print(f"  V_pore_max       : {V_pore_max:.4e} m/s  ({V_pore_max * 1e3:.3f} mm/s)")
+        print(f"  Acoustic dt      : {dt:.4e} s  (u_lb = {self.target_ulb_max})")
+        print(f"  Total LBM steps  : {n_steps}  (covers {t_phys_total:.4e} s physical)")
+        print(f"  Recalibrated τ   : f={tau_f:.4f}  c={tau_c:.4f}  t={tau_t:.4f}")
+        print("======================================================\n")
+
+        return dt, n_steps, tau_f, tau_c, tau_t, V_pore_max
+
 
 # =========================================================================
 # คลาสจำลอง Reactive MCMP Simulator (สืบทอดจาก Multiphase Core)
@@ -242,10 +338,10 @@ def run_simulation():
     
     ny, nz = mask.shape[1], mask.shape[2]
     Y, Z = np.meshgrid(np.arange(ny), np.arange(nz), indexing='ij')
-    radius = 30.0 
-    cy, cz = ny / 2.0, radius 
+    radius_vox = args.inject_size / 2.0          # injection port radius in voxels
+    cy, cz = ny / 2.0, nz / 2.0                 # centre of the YZ inlet face
     r_sq = (Y - cy)**2 + (Z - cz)**2
-    circular_mask_np = r_sq <= radius**2
+    circular_mask_np = r_sq <= radius_vox**2
     circular_mask = jnp.array(circular_mask_np) 
     
     lattice = LatticeD3Q19("f64/f64")
@@ -256,39 +352,55 @@ def run_simulation():
     
     dx_m = args.dx_um * 1e-6    
     dx_mm = args.dx_um * 1e-3   
-    nu_phys = 1e-6 
-    
-    tau_f_ref = 1.0   
-    tau_t = 0.55  
-    tau_c = 0.95  
+
+    # ---- Physical transport coefficients ----
+    nu_phys    = 1e-6       # kinematic viscosity of water at 25°C  [m^2/s]
+    D_phys     = 1.0e-9     # CuSO4 solute diffusivity in water     [m^2/s]
+    alpha_phys = 1.4e-7     # thermal diffusivity of water           [m^2/s]
+
     k_r = 0.15
-    omega_t, omega_c = 1.0/tau_t, 1.0/tau_c
-    
+    Q_m3s = args.flow_rate / 3.6e9                              # [m^3/s]
+    inject_radius_m = radius_vox * dx_m                         # [m]
+
+    # Physical simulation duration: use --t_phys if given, otherwise derive
+    # from --steps using the reference dt (tau_f=1.0 at the current nu_phys).
+    _nu_lb_ref = (1.0 - 0.5) / 3.0
+    _dt_ref    = (_nu_lb_ref * dx_m ** 2) / nu_phys
+    t_phys_total = args.t_phys if args.t_phys is not None else args.steps * _dt_ref
+
+    # ---- Geometry-Aware Circular Port Acoustic Scaling ----
+    mask_np_cropped = np.array(mask, dtype=bool)
+    scaler = CircularAcousticScaler(dx=dx_m, target_ulb_max=0.02)
+    dt_s, n_steps, tau_f_ref, tau_c, tau_t = scaler.recalibrate(
+        Q_ml_hr      = args.flow_rate,
+        geometry_array = mask_np_cropped,
+        inject_radius_m = inject_radius_m,
+        nu_phys      = nu_phys,
+        D_phys       = D_phys,
+        alpha_phys   = alpha_phys,
+        t_phys_total = t_phys_total,
+    )[:5]   # discard V_pore_max diagnostic return value
+
+    # Relaxation frequencies derived from recalibrated τ values
+    omega_t, omega_c = 1.0 / tau_t, 1.0 / tau_c
+
+    # Lattice inlet velocity is exactly target_ulb_max = 0.02 by construction
+    u_lb = scaler.target_ulb_max
     nu_lb = (tau_f_ref - 0.5) / 3.0
-    dt_s = (nu_lb * (dx_m ** 2)) / nu_phys 
-    
-    Q_m3s = args.flow_rate / 3.6e9  
-    cross_section_area_m2 = float(np.sum(circular_mask_np)) * (dx_m ** 2)
-    u_phys_inlet = Q_m3s / cross_section_area_m2 
-    u_lb = u_phys_inlet * (dt_s / dx_m)
-    # Cap lattice inlet velocity to 0.02 to stay in the low-Mach stable regime.
-    # Flow rates that would exceed this are physically represented at the capped speed;
-    # increase --steps proportionally to preserve the same physical duration.
-    U_LB_MAX = 0.02
-    if u_lb > U_LB_MAX:
-        print(f"  [Warning] u_lb={u_lb:.4f} exceeds stability limit {U_LB_MAX}. Capping to {U_LB_MAX}.")
-        print(f"  [Hint] Increase --steps by ~{u_lb/U_LB_MAX:.1f}x to maintain physical duration.")
-        u_lb = U_LB_MAX
 
     vol_scale_mm3 = dx_mm ** 3
-    k_scale_m2 = dx_m ** 2
-    k_scale_darcy = k_scale_m2 / 0.9869233e-12  
-    u_scale_mms = (dx_mm / dt_s)                
-    
-    print("\n--- Physical Scales Confirmed (MCMP PR-EOS Mode) ---")
-    print(f"  Voxel Size: {args.dx_um} um")
-    print(f"  Time Step (dt): {dt_s:.2e} s")
-    print(f"  Inlet Velocity (Target): {u_phys_inlet*1000:.2f} mm/s (LBM: {u_lb:.4f})")
+    k_scale_m2    = dx_m ** 2
+    k_scale_darcy = k_scale_m2 / 0.9869233e-12
+    u_scale_mms   = dx_mm / dt_s
+
+    # Back-calculate physical inlet velocity for diagnostics
+    u_phys_inlet = u_lb * dx_m / dt_s
+
+    print("--- Physical Scales Confirmed (MCMP PR-EOS Mode) ---")
+    print(f"  Voxel Size      : {args.dx_um} um")
+    print(f"  Acoustic dt     : {dt_s:.4e} s")
+    print(f"  Total LBM steps : {n_steps}  (physical time = {t_phys_total:.4e} s)")
+    print(f"  Inlet Velocity  : {u_phys_inlet*1000:.4f} mm/s  (u_lb = {u_lb:.4f})")
     print("----------------------------------------------------\n")
 
     # ---------------------------------------------------------
@@ -544,12 +656,61 @@ def run_simulation():
         # u_eq is returned so the outer loop can pass it to thermal_solver.step()
         return f_tree_out, h_str, solid_frac, u_eq
 
-    os.makedirs("outputs/vti", exist_ok=True)
-    os.makedirs("outputs/analytics", exist_ok=True)
-    
-    with open("outputs/global_kinetics.csv", "w", newline="") as f_csv1, \
-         open("outputs/object_analysis.csv", "w", newline="") as f_csv2, \
-         open("outputs/pore_clogging_stats.csv", "w", newline="") as f_csv3:
+    # สร้าง Timestamp Folder เช่น "outputs/run_20261025_143000"
+    timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = f"outputs/run_{timestamp_str}"
+
+    os.makedirs(f"{out_dir}/vti", exist_ok=True)
+    os.makedirs(f"{out_dir}/analytics", exist_ok=True)
+   
+    # ----------------------------------------------------
+    # [NEW] สร้างไฟล์ run_summary.txt เพื่อเก็บ Parameters
+    # ----------------------------------------------------
+    summary_path = os.path.join(out_dir, "run_summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as f_sum:
+        f_sum.write("=================================================\n")
+        f_sum.write("      JAX-LaB CuSO4 Simulation Run Summary       \n")
+        f_sum.write("=================================================\n")
+        f_sum.write(f"Run Timestamp : {timestamp_str}\n")
+        f_sum.write(f"Output Folder : {out_dir}\n\n")
+        
+        f_sum.write("--- 1. User Input Arguments ---\n")
+        f_sum.write(f"Geometry File      : {args.geom}\n")
+        f_sum.write(f"Flow Axis          : {args.axis}\n")
+        f_sum.write(f"Flow Rate          : {args.flow_rate} mL/hr\n")
+        f_sum.write(f"Voxel Size (dx)    : {args.dx_um} um\n")
+        f_sum.write(f"Total LBM Steps    : {n_steps}  (physical {t_phys_total:.4e} s)\n")
+        f_sum.write(f"Injection Size     : {args.inject_size}^3\n\n")
+        
+        f_sum.write("--- 2. Physical & LBM Scales (Acoustic Scaling) ---\n")
+        f_sum.write(f"Domain Grid Size   : {mask.shape[0]} x {mask.shape[1]} x {mask.shape[2]}\n")
+        f_sum.write(f"Inject Radius      : {inject_radius_m * 1e3:.3f} mm\n")
+        f_sum.write(f"Acoustic dt        : {dt_s:.6e} s\n")
+        f_sum.write(f"Physical Duration  : {t_phys_total:.4e} s\n")
+        f_sum.write(f"Physical Inlet Vel : {u_phys_inlet * 1000:.4f} mm/s\n")
+        f_sum.write(f"LBM Inlet Vel (u)  : {u_lb:.6f}  (bounded = 0.02)\n")
+        f_sum.write(f"Kinematic Visc(nu) : {nu_phys:.2e} m^2/s\n")
+        f_sum.write(f"Solute Diff (D)    : {D_phys:.2e} m^2/s\n")
+        f_sum.write(f"Thermal Diff (a)   : {alpha_phys:.2e} m^2/s\n\n")
+
+        f_sum.write("--- 3. Thermodynamics & Kinetics ---\n")
+        f_sum.write(f"Inlet Temp (T_hot) : {75.0} C\n")
+        f_sum.write(f"Wall Temp (T_cold) : {25.0} C\n")
+        f_sum.write(f"CHT eta            : 0.15\n")
+        f_sum.write(f"Inlet Conc (C_in)  : 60.0 g/100mL\n")
+        f_sum.write(f"Reaction Rate (k_r): {k_r}\n\n")
+
+        f_sum.write("--- 4. Transport-Invariant Relaxation Parameters ---\n")
+        f_sum.write(f"Fluid  tau_f       : {tau_f_ref:.6f}  (nu_lb = {nu_lb:.6f})\n")
+        f_sum.write(f"Thermal tau_t      : {tau_t:.6f}\n")
+        f_sum.write(f"Solute  tau_c      : {tau_c:.6f}\n")
+        f_sum.write("=================================================\n")
+        
+    print(f"\n[INFO] Simulation parameters saved to: {summary_path}\n")
+
+    with open(f"{out_dir}/global_kinetics.csv", "w", newline="") as f_csv1, \
+         open(f"{out_dir}/object_analysis.csv", "w", newline="") as f_csv2, \
+         open(f"{out_dir}/pore_clogging_stats.csv", "w", newline="") as f_csv3:
         csv.writer(f_csv1).writerow(["Step", "Time_s", "Total_Solid_Volume_mm3", "Porosity", "Global_Permeability_Darcy", "Avg_Temperature"])
         csv.writer(f_csv2).writerow(["Step", "Number_of_Crystals", "Avg_Crystal_Size", "Max_Crystal_Size", "Surface_Area"])
         csv.writer(f_csv3).writerow(["Step", "Min_Throat_Size", "Tortuosity_Index"])
@@ -557,7 +718,7 @@ def run_simulation():
     domain_length = float(args.inject_size)
     D_solute = (1.0/3.0) * (tau_c - 0.5)
 
-    print(f"Running Reactive MCMP (PR-EOS) + Thermal-class CHT, {args.steps} LBM steps...")
+    print(f"Running Reactive MCMP (PR-EOS) + Thermal-class CHT, {n_steps} LBM steps...")
     # State is now split: (f_tree, h, solid_frac) for MCMP+concentration
     # and `g` for temperature, driven by CuSO4_ThermalSolver each step.
     mask_cpu = np.array(mask)
@@ -608,10 +769,10 @@ def run_simulation():
                 'Z_proj': {'solid_sum': np.sum(solid_np, axis=2).copy()}
             }
 
-            save_vti_file(f"outputs/vti/precipitate_growth_t{current_step}.vti", binary_precipitate, "CuSO4_Solid")
-            save_vti_file(f"outputs/vti/velocity_evolution_t{current_step}.vti", u_np, "Velocity", is_vector=True)
-            save_vti_file(f"outputs/vti/supersaturation_map_t{current_step}.vti", supersat_map, "Supersaturation")
-            save_vti_file(f"outputs/vti/cuso4_phase_t{current_step}.vti", rho1_np / safe_rho_tot, "CuSO4_Phase")
+            save_vti_file(f"{out_dir}/vti/precipitate_growth_t{current_step}.vti", binary_precipitate, "CuSO4_Solid")
+            save_vti_file(f"{out_dir}/vti/velocity_evolution_t{current_step}.vti", u_np, "Velocity", is_vector=True)
+            save_vti_file(f"{out_dir}/vti/supersaturation_map_t{current_step}.vti", supersat_map, "Supersaturation")
+            save_vti_file(f"{out_dir}/vti/cuso4_phase_t{current_step}.vti", rho1_np / safe_rho_tot, "CuSO4_Phase")
 
             P_in = np.mean(rho_tot_np[0][circular_mask_np]) / 3.0
             P_out = np.mean(rho_tot_np[-1][circular_mask_np]) / 3.0
@@ -656,16 +817,16 @@ def run_simulation():
             from src.physics.stability_utils import log_pseudopotential_stability
             log_pseudopotential_stability(rho_tree_diag, pr_eos, current_step, fluid_mask=mask_cpu)
 
-            with open("outputs/global_kinetics.csv", "a", newline="") as f_csv1, \
-                 open("outputs/object_analysis.csv", "a", newline="") as f_csv2, \
-                 open("outputs/pore_clogging_stats.csv", "a", newline="") as f_csv3:
+            with open(f"{out_dir}/global_kinetics.csv", "a", newline="") as f_csv1, \
+                 open(f"{out_dir}/object_analysis.csv", "a", newline="") as f_csv2, \
+                 open(f"{out_dir}/pore_clogging_stats.csv", "a", newline="") as f_csv3:
                 csv.writer(f_csv1).writerow([current_step, time_s, current_solid_vol_mm3, porosity, k_perm_darcy, avg_T])
                 csv.writer(f_csv2).writerow([current_step, num_features, avg_size, max_size, surface_area])
                 csv.writer(f_csv3).writerow([current_step, min_throat, tortuosity])
 
-            print(f"Step {current_step}/{args.steps} | Time: {time_s:.2f} s | Porosity: {porosity:.4f} | Crystals: {num_features} | k: {k_perm_darcy:.2e} Darcy | Max Supersat: {max_supersat:.4f} | Crystal Vol: {current_solid_vol_mm3:.2e} mm3")
+            print(f"Step {current_step}/{n_steps} | Time: {time_s:.2f} s | Porosity: {porosity:.4f} | Crystals: {num_features} | k: {k_perm_darcy:.2e} Darcy | Max Supersat: {max_supersat:.4f} | Crystal Vol: {current_solid_vol_mm3:.2e} mm3")
 
-        if current_step >= args.steps:
+        if current_step >= n_steps:
             break
 
         # ---- Single LBM step ----
@@ -686,11 +847,10 @@ def run_simulation():
     Da_map = (k_r * L_ref) / u_mag_safe
     pe_da_data = (Pe_map[fluid_mask_current], Da_map[fluid_mask_current])
 
-    return (vel_mag_t0, vel_mag_tfinal, pe_da_data, maps_data, mask_cpu, u_scale_mms)
+    return (vel_mag_t0, vel_mag_tfinal, pe_da_data, maps_data, mask_cpu, u_scale_mms, out_dir)
 
-# --- ละโค้ด generate_reaction_maps และ generate_analytical_plots ไว้ด้านล่าง (ใช้โค้ดชุด v3 เดิมได้เลย) ---
-def generate_reaction_maps(maps_data, mask_np):
-    print("\nGenerating Spatial Reaction Maps (XY, XZ, YZ, and Z-Projection)...")
+def generate_reaction_maps(maps_data, mask_np, out_dir):
+    print(f"\nGenerating Spatial Reaction Maps in {out_dir}/analytics ...")
     steps_saved = sorted(list(maps_data.keys()))
     
     if len(steps_saved) >= 3:
@@ -716,27 +876,32 @@ def generate_reaction_maps(maps_data, mask_np):
             C_slice = maps_data[step][plane_name]['C'].astype(float)
             solid_slice = maps_data[step][plane_name]['solid'].astype(float)
             
+            # Masking non-fluid nodes for visualization
             T_slice[~mask_slice] = np.nan
             C_slice[~mask_slice] = np.nan
             solid_slice[~mask_slice] = np.nan
             
+            # 1. Temperature Map (25°C to 75°C)
             im0 = axes[row_idx, 0].imshow(T_slice.T, cmap='inferno', origin='lower', vmin=25, vmax=75)
             axes[row_idx, 0].set_title(f'Step {step}: Temp (°C)')
             fig.colorbar(im0, ax=axes[row_idx, 0], fraction=0.046, pad=0.04)
             
-            im1 = axes[row_idx, 1].imshow(C_slice.T, cmap='viridis', origin='lower', vmin=0, vmax=1.0)
-            axes[row_idx, 1].set_title(f'Step {step}: CuSO4 Conc.')
+            # 2. Concentration Map (0 to 65 g/100mL)
+            im1 = axes[row_idx, 1].imshow(C_slice.T, cmap='viridis', origin='lower', vmin=0, vmax=65.0)
+            axes[row_idx, 1].set_title(f'Step {step}: CuSO\u2084 Conc. (g/100mL)')
             fig.colorbar(im1, ax=axes[row_idx, 1], fraction=0.046, pad=0.04)
             
-            im2 = axes[row_idx, 2].imshow(solid_slice.T, cmap='cool', origin='lower')
-            axes[row_idx, 2].set_title(f'Step {step}: Crystal Vol')
+            # 3. Solid Fraction Map
+            im2 = axes[row_idx, 2].imshow(solid_slice.T, cmap='YlGnBu', origin='lower', vmin=0, vmax=1.0)
+            axes[row_idx, 2].set_title(f'Step {step}: Crystal Vol Fraction')
             fig.colorbar(im2, ax=axes[row_idx, 2], fraction=0.046, pad=0.04)
             
-        fig.suptitle(f"Reactive Transport Evolution: {plane_info['title']}", fontsize=20)
+        fig.suptitle(f"Reactive Transport Evolution: {plane_info['title']}", fontsize=18, fontweight='bold')
         fig.tight_layout()
-        fig.savefig(f"outputs/analytics/cuso4_reaction_maps_{plane_name}.png", dpi=300, bbox_inches='tight')
+        fig.savefig(f"{out_dir}/analytics/cuso4_reaction_maps_{plane_name}.png", dpi=300, bbox_inches='tight')
         plt.close()
 
+    # Z-Projection Map
     fig_proj, axes_proj = plt.subplots(1, len(steps_to_plot), figsize=(6 * len(steps_to_plot), 5))
     if len(steps_to_plot) == 1: axes_proj = [axes_proj]
 
@@ -747,22 +912,22 @@ def generate_reaction_maps(maps_data, mask_np):
         solid_sum = maps_data[step]['Z_proj']['solid_sum'].astype(float)
         solid_sum[np.isnan(pore_depth)] = np.nan 
 
-        im = axes_proj[col_idx].imshow(solid_sum.T, cmap='magma', origin='lower')
+        im = axes_proj[col_idx].imshow(solid_sum.T, cmap='cividis', origin='lower')
         axes_proj[col_idx].set_title(f'Step {step}: Total Crystal Depth')
         fig_proj.colorbar(im, ax=axes_proj[col_idx], fraction=0.046, pad=0.04)
 
-    fig_proj.suptitle("Z-Projection (Top-down Sum of Crystal Volume)", fontsize=20)
+    fig_proj.suptitle("Z-Projection (Top-down Sum of Crystal Volume)", fontsize=18, fontweight='bold')
     fig_proj.tight_layout()
-    fig_proj.savefig("outputs/analytics/cuso4_reaction_maps_Z_projection.png", dpi=300, bbox_inches='tight')
+    fig_proj.savefig(f"{out_dir}/analytics/cuso4_reaction_maps_Z_projection.png", dpi=300, bbox_inches='tight')
     plt.close()
     print("  -> Saved Z-Projection Map")
 
-def generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms):
-    print("Generating Analytical PNG Plots (Physical Units)...")
-    os.makedirs("outputs/analytics", exist_ok=True)
+def generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms, out_dir):
+    print(f"Generating Analytical PNG Plots in {out_dir}/analytics ...")
     
-    kinetics = np.genfromtxt("outputs/global_kinetics.csv", delimiter=',', skip_header=1)
-    objects = np.genfromtxt("outputs/object_analysis.csv", delimiter=',', skip_header=1)
+    # Load CSVs from the specific timestamped directory
+    kinetics = np.genfromtxt(f"{out_dir}/global_kinetics.csv", delimiter=',', skip_header=1)
+    objects = np.genfromtxt(f"{out_dir}/object_analysis.csv", delimiter=',', skip_header=1)
     
     if kinetics.ndim > 1:
         time_s = kinetics[:, 1]
@@ -777,29 +942,37 @@ def generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms):
         else:
             plt.plot(time_s, k_mag, 'b-o', linewidth=2)
             
-        plt.title("Absolute Permeability Reduction")
-        plt.xlabel("Time (Seconds)")
-        plt.ylabel("Permeability (Darcy)")
+        plt.title("Absolute Permeability Reduction", fontsize=14, fontweight='bold')
+        plt.xlabel("Time (Seconds)", fontsize=12)
+        plt.ylabel("Permeability (Darcy)", fontsize=12)
         plt.yscale('log') 
         plt.grid(True, which="both", ls="--", alpha=0.5)
-        plt.savefig("outputs/analytics/permeability_reduction.png", dpi=300, bbox_inches='tight')
+        plt.savefig(f"{out_dir}/analytics/permeability_reduction.png", dpi=300, bbox_inches='tight')
         plt.close()
 
     plt.figure(figsize=(8, 6))
     v0_valid = (vel_t0[vel_t0 > 1e-6] * u_scale_mms) if vel_t0 is not None else []
     vf_valid = (vel_tfinal[vel_tfinal > 1e-6] * u_scale_mms) if vel_tfinal is not None else []
-    
+
+    # [FIX] Calculate a shared global maximum to ensure bin widths match perfectly
+    max_v = 0.0
+    if len(v0_valid) > 0: max_v = max(max_v, np.max(v0_valid))
+    if len(vf_valid) > 0: max_v = max(max_v, np.max(vf_valid))
+
+    # [FIX] Force both histograms to use the exact same 50 bins
+    shared_bins = np.linspace(0, max_v, 50)
+
     if len(v0_valid) > 0:
-        plt.hist(v0_valid, bins=50, alpha=0.5, label='Initial', density=True, color='blue')
+        plt.hist(v0_valid, bins=shared_bins, alpha=0.6, label='Initial (Pre-Clogging)', density=True, color='royalblue')
     if len(vf_valid) > 0:
-        plt.hist(vf_valid, bins=50, alpha=0.5, label='Clogged', density=True, color='red')
-        
-    plt.title("Pore Velocity Distribution Shift")
-    plt.xlabel("Local Velocity Magnitude (mm/s)")
-    plt.ylabel("Probability Density")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig("outputs/analytics/velocity_distribution_shift.png", dpi=300, bbox_inches='tight')
+        plt.hist(vf_valid, bins=shared_bins, alpha=0.6, label='Final (Clogged)', density=True, color='crimson')
+
+    plt.title("Pore Velocity Distribution Shift", fontsize=14, fontweight='bold')
+    plt.xlabel("Local Velocity Magnitude (mm/s)", fontsize=12)
+    plt.ylabel("Probability Density", fontsize=12)
+    plt.legend(fontsize=11)
+    plt.grid(True, ls=":", alpha=0.7)
+    plt.savefig(f"{out_dir}/analytics/velocity_distribution_shift.png", dpi=300, bbox_inches='tight')
     plt.close()
 
     if objects.ndim > 1 and kinetics.ndim > 1:
@@ -811,47 +984,54 @@ def generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms):
         
         fig, ax1 = plt.subplots(figsize=(8, 6))
         
-        color1 = 'tab:red'
-        ax1.set_xlabel('Time (Seconds)')
-        ax1.set_ylabel('Total Precipitation Volume ($mm^3$)', color=color1)
+        color1 = 'crimson'
+        ax1.set_xlabel('Time (Seconds)', fontsize=12)
+        ax1.set_ylabel('Total Precipitation Volume ($mm^3$)', color=color1, fontsize=12)
         ax1.plot(time_s, vol_mm3, color=color1, linewidth=2, marker='s', label='Volume')
         ax1.tick_params(axis='y', labelcolor=color1)
 
         ax2 = ax1.twinx()  
-        color2 = 'tab:blue'
-        ax2.set_ylabel('Surface Area / Volume Ratio (SA/V)', color=color2)  
+        color2 = 'teal'
+        ax2.set_ylabel('Surface Area / Volume Ratio (SA/V)', color=color2, fontsize=12)  
         ax2.plot(time_s, sa_v_ratio, color=color2, linewidth=2, marker='o', label='SA/V Ratio')
         ax2.tick_params(axis='y', labelcolor=color2)
 
-        plt.title("Morphology Trajectory: Patchy vs Layer-like Growth")
+        plt.title("Morphology Trajectory: Patchy vs Layer-like Growth", fontsize=14, fontweight='bold')
         fig.tight_layout()  
-        plt.savefig("outputs/analytics/morphology_trajectory.png", dpi=300, bbox_inches='tight')
+        plt.savefig(f"{out_dir}/analytics/morphology_trajectory.png", dpi=300, bbox_inches='tight')
         plt.close()
 
     if pe_da_data is not None:
         Pe_vals, Da_vals = pe_da_data
-        valid_mask = (Pe_vals > 0) & (Da_vals > 0)
+
+        # [FIX] Filter out extreme unphysical outliers (dead/clogged zones with u≈0)
+        valid_mask = (Pe_vals > 1e-6) & (Da_vals < 1e6) & (Da_vals > 1e-6)
         Pe_valid = Pe_vals[valid_mask]
         Da_valid = Da_vals[valid_mask]
-        
+
         plt.figure(figsize=(8, 6))
         num_points = min(5000, len(Pe_valid))
         if num_points > 0:
             idx = np.random.choice(len(Pe_valid), num_points, replace=False)
-            plt.scatter(Da_valid[idx], Pe_valid[idx], alpha=0.4, c='purple', s=15, edgecolors='none')
-            
+            plt.scatter(Da_valid[idx], Pe_valid[idx], alpha=0.5, c='darkmagenta', s=15, edgecolors='none')
+
         plt.xscale('log')
         plt.yscale('log')
-        plt.title("Local Transport Regime ($Pe$ vs $Da$)")
-        plt.xlabel("Damköhler Number ($Da$) - Reaction Dominance")
-        plt.ylabel("Péclet Number ($Pe$) - Advection Dominance")
+
+        # [FIX] Clamp axes so infinity/zero outliers don't squash the data into a dot
+        plt.xlim(left=1e-4, right=1e4)
+        plt.ylim(bottom=1e-4, top=1e4)
+
+        plt.title("Local Transport Regime ($Pe$ vs $Da$)", fontsize=14, fontweight='bold')
+        plt.xlabel("Damk\u00f6hler Number ($Da$) - Reaction Dominance", fontsize=12)
+        plt.ylabel("P\u00e9clet Number ($Pe$) - Advection Dominance", fontsize=12)
         plt.grid(True, which="both", ls="--", alpha=0.5)
-        
+
         plt.axhline(y=1, color='k', linestyle='-', alpha=0.8)
         plt.axvline(x=1, color='k', linestyle='-', alpha=0.8)
-        plt.text(0.01, 10, 'Advection-Limited', fontsize=10, color='darkgreen')
-        plt.text(10, 0.01, 'Reaction-Limited', fontsize=10, color='darkred')
-        plt.savefig("outputs/analytics/transport_regime_da_pe.png", dpi=300, bbox_inches='tight')
+        plt.text(1e-3, 1e1, 'Advection-Limited', fontsize=11, color='darkgreen', fontweight='bold')
+        plt.text(1e1, 1e-3, 'Reaction-Limited', fontsize=11, color='darkred', fontweight='bold')
+        plt.savefig(f"{out_dir}/analytics/transport_regime_da_pe.png", dpi=300, bbox_inches='tight')
         plt.close()
 
     if objects.ndim > 1 and kinetics.ndim > 1:
@@ -861,26 +1041,26 @@ def generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms):
         
         fig, ax1 = plt.subplots(figsize=(8, 6))
         
-        color1 = 'tab:green'
-        ax1.set_xlabel('Time (Seconds)')
-        ax1.set_ylabel('Number of Crystals (Nucleation Sites)', color=color1)
+        color1 = 'forestgreen'
+        ax1.set_xlabel('Time (Seconds)', fontsize=12)
+        ax1.set_ylabel('Number of Crystals (Nucleation Sites)', color=color1, fontsize=12)
         ax1.plot(time_s, num_crystals, color=color1, linewidth=2, marker='^', label='Crystal Count')
         ax1.tick_params(axis='y', labelcolor=color1)
 
         ax2 = ax1.twinx()  
-        color2 = 'tab:red'
-        ax2.set_ylabel('Total Precipitation Volume ($mm^3$)', color=color2)  
+        color2 = 'crimson'
+        ax2.set_ylabel('Total Precipitation Volume ($mm^3$)', color=color2, fontsize=12)  
         ax2.plot(time_s, vol_mm3, color=color2, linewidth=2, marker='s', label='Volume')
         ax2.tick_params(axis='y', labelcolor=color2)
 
-        plt.title("Nucleation Saturation: Crystal Count & Volume vs Time")
+        plt.title("Nucleation Saturation: Crystal Count & Volume vs Time", fontsize=14, fontweight='bold')
         fig.tight_layout()  
-        plt.savefig("outputs/analytics/nucleation_saturation.png", dpi=300, bbox_inches='tight')
+        plt.savefig(f"{out_dir}/analytics/nucleation_saturation.png", dpi=300, bbox_inches='tight')
         plt.close()
         
-    print("All analytical PNGs (Physical Units) exported successfully!")
+    print("All analytical PNGs exported successfully!")
 
 if __name__ == "__main__":
-    vel_t0, vel_tfinal, pe_da_data, maps_data, mask_np, u_scale_mms = run_simulation()
-    generate_reaction_maps(maps_data, mask_np)
-    generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms)
+    vel_t0, vel_tfinal, pe_da_data, maps_data, mask_np, u_scale_mms, out_dir = run_simulation()
+    generate_reaction_maps(maps_data, mask_np, out_dir)
+    generate_analytical_plots(vel_t0, vel_tfinal, pe_da_data, u_scale_mms, out_dir)

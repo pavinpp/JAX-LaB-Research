@@ -167,4 +167,4 @@ dmypy.json
 checkpoints/*
 
 # Large local data files
-digital_rock_project/tiff_stack/empty_chip.tif
+cuso4_precipitation/digital_rock_project/tiff_stack/empty_chip.tif

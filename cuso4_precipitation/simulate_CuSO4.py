@@ -15,7 +15,7 @@ import datetime
 import scipy.ndimage as ndimage
 import pyvista as pv
 
-sys.path.append(os.path.abspath("../../"))
+sys.path.append(os.path.abspath("../"))
 
 from src.lattice import LatticeD3Q19
 from src.physics.crystallization import compute_heterogeneous_precipitation, calculate_equilibrium_concentration
@@ -30,6 +30,7 @@ from src.multiphase import MultiphaseMRT
 from src.eos import Peng_Robinson
 from src.thermal import BGKSim as ThermalBGK
 from src.boundary_conditions import BounceBackHalfway, EquilibriumBC, DoNothing
+from src.physics.viscosity import CuSO4ViscositySimulator
 
 def parse_ui_args():
     parser = argparse.ArgumentParser(description="JAX-LaB CuSO4 (v5 PR-EOS MCMP)")
@@ -39,6 +40,9 @@ def parse_ui_args():
     parser.add_argument("--dx_um", type=float, default=20.0, help="Voxel size in micrometers (um)")
     parser.add_argument("--steps", type=int, default=10000)
     parser.add_argument("--inject_size", type=int, default=60)
+    parser.add_argument("--t_phys", type=float, default=None,
+                        help="Total physical simulation time in seconds. "
+                             "If omitted, derived from --steps using a reference tau_f=1.0 dt.")
     return parser.parse_args()
 
 def save_vti_file(filename, array, name, is_vector=False):
@@ -52,14 +56,103 @@ def save_vti_file(filename, array, name, is_vector=False):
         grid.point_data[name] = array.flatten(order="F")
     grid.save(filename)
 
-@jit
-def calculate_tau_f(T_celsius, tau_ref=1.0):
-    temp_points = jnp.array([25.0, 35.0, 45.0, 55.0, 65.0, 75.0], dtype=jnp.float64)
-    viscosity_points = jnp.array([1.35, 1.08, 0.89, 0.74, 0.63, 0.55], dtype=jnp.float64)
-    mu_T = jnp.interp(T_celsius, temp_points, viscosity_points)
-    mu_ref = 1.35 
-    tau_f = 0.5 + (tau_ref - 0.5) * (mu_T / mu_ref)
-    return tau_f
+# NOTE: calculate_tau_f (table-interpolation) has been replaced by the
+# Price–Davenport empirical model via CuSO4ViscositySimulator.
+# The JIT-compiled `update_dynamic_relaxation_time` closure (defined inside
+# run_simulation after acoustic scaling is complete) provides the full
+# spatially-varying τ_f field.
+
+
+# =========================================================================
+# Geometry-Aware Circular Port Acoustic Scaler
+# Guarantees u_lb ≤ target_ulb_max by deriving dt and n_steps from the
+# true bottleneck interstitial velocity at the injection face, then
+# recalibrates τ_f, τ_c, τ_t to preserve macroscopic ν, D, α exactly.
+# =========================================================================
+class CircularAcousticScaler:
+    """Derives a Mach-safe dt from the pore-scale bottleneck velocity.
+
+    Parameters
+    ----------
+    dx : float
+        Voxel size in metres.
+    target_ulb_max : float
+        Maximum allowed lattice velocity (default 0.02 for low-Mach stability).
+    cs2 : float
+        Lattice speed-of-sound squared (1/3 for standard D3Q19).
+    """
+    def __init__(self, dx: float, target_ulb_max: float = 0.02, cs2: float = 1.0 / 3.0):
+        self.dx = float(dx)
+        self.target_ulb_max = float(target_ulb_max)
+        self.cs2 = float(cs2)
+
+    def recalibrate(
+        self,
+        Q_ml_hr: float,
+        geometry_array: np.ndarray,
+        inject_radius_m: float,
+        nu_phys: float,
+        D_phys: float,
+        alpha_phys: float,
+        t_phys_total: float,
+    ):
+        """Compute Mach-safe dt, total LBM steps, and transport-invariant τ values.
+
+        Parameters
+        ----------
+        Q_ml_hr        : volumetric flow rate in mL/hr
+        geometry_array : boolean 3-D array, True = fluid
+        inject_radius_m: physical radius of the injection port in metres
+        nu_phys        : kinematic viscosity of the fluid (m^2/s)
+        D_phys         : solute mass diffusivity (m^2/s)
+        alpha_phys     : thermal diffusivity (m^2/s)
+        t_phys_total   : desired simulation duration in seconds
+        """
+        # 1. Convert flow rate to m^3/s
+        Q_m3_s = Q_ml_hr * (1e-6 / 3600.0)
+
+        # 2. Build circular mask for the inlet face (first x-plane)
+        inlet_slice = geometry_array[0, :, :]      # shape (Ny, Nz)
+        Ny, Nz = inlet_slice.shape
+        cy_c, cz_c = Ny // 2, Nz // 2
+        y_idx, z_idx = np.ogrid[:Ny, :Nz]
+        distance_m = np.sqrt((y_idx - cy_c) ** 2 + (z_idx - cz_c) ** 2) * self.dx
+        circular_mask = distance_m <= inject_radius_m
+
+        # 3. Effective open area: fluid nodes only inside the circular port
+        fluid_nodes_in_circle = inlet_slice & circular_mask
+        N_eff = int(np.sum(fluid_nodes_in_circle))
+        if N_eff == 0:
+            raise ValueError(
+                "CircularAcousticScaler: zero fluid nodes in the injection port. "
+                "Increase inject_size or check the geometry mask."
+            )
+        A_eff = N_eff * (self.dx ** 2)          # m^2
+
+        # 4. Maximum bottleneck interstitial velocity through fluid pores only
+        V_pore_max = Q_m3_s / A_eff             # m/s
+
+        # 5. Acoustic (diffusive) scaling: choose dt so u_lb = target_ulb_max exactly
+        dt = (self.target_ulb_max * self.dx) / V_pore_max
+        n_steps = int(np.ceil(t_phys_total / dt))
+
+        # 6. Transport-invariant relaxation recalibration
+        #    τ = 0.5 + (transport_coeff * dt) / (cs2 * dx^2)
+        tau_f = 0.5 + (nu_phys * dt)    / (self.cs2 * self.dx ** 2)
+        tau_c = 0.5 + (D_phys  * dt)    / (self.cs2 * self.dx ** 2)
+        tau_t = 0.5 + (alpha_phys * dt) / (self.cs2 * self.dx ** 2)
+
+        print("\n=== Circular Port Acoustic Scaling (Geometry-Aware) ===")
+        print(f"  Inject radius    : {inject_radius_m * 1e3:.3f} mm")
+        print(f"  Effective area   : {A_eff:.4e} m^2  ({N_eff} fluid nodes)")
+        print(f"  V_pore_max       : {V_pore_max:.4e} m/s  ({V_pore_max * 1e3:.3f} mm/s)")
+        print(f"  Acoustic dt      : {dt:.4e} s  (u_lb = {self.target_ulb_max})")
+        print(f"  Total LBM steps  : {n_steps}  (covers {t_phys_total:.4e} s physical)")
+        print(f"  Recalibrated τ   : f={tau_f:.4f}  c={tau_c:.4f}  t={tau_t:.4f}")
+        print("======================================================\n")
+
+        return dt, n_steps, tau_f, tau_c, tau_t, V_pore_max
+
 
 # =========================================================================
 # คลาสจำลอง Reactive MCMP Simulator (สืบทอดจาก Multiphase Core)
@@ -243,10 +336,10 @@ def run_simulation():
     
     ny, nz = mask.shape[1], mask.shape[2]
     Y, Z = np.meshgrid(np.arange(ny), np.arange(nz), indexing='ij')
-    radius = 30.0 
-    cy, cz = ny / 2.0, radius 
+    radius_vox = args.inject_size / 2.0          # injection port radius in voxels
+    cy, cz = ny / 2.0, nz / 2.0                 # centre of the YZ inlet face
     r_sq = (Y - cy)**2 + (Z - cz)**2
-    circular_mask_np = r_sq <= radius**2
+    circular_mask_np = r_sq <= radius_vox**2
     circular_mask = jnp.array(circular_mask_np) 
     
     lattice = LatticeD3Q19("f64/f64")
@@ -257,39 +350,86 @@ def run_simulation():
     
     dx_m = args.dx_um * 1e-6    
     dx_mm = args.dx_um * 1e-3   
-    nu_phys = 1e-6 
-    
-    tau_f_ref = 1.0   
-    tau_t = 0.55  
-    tau_c = 0.95  
+
+    # ---- Physical transport coefficients ----
+    nu_phys    = 1e-6       # kinematic viscosity of water at 25°C  [m^2/s]
+    D_phys     = 1.0e-9     # CuSO4 solute diffusivity in water     [m^2/s]
+    alpha_phys = 1.4e-7     # thermal diffusivity of water           [m^2/s]
+
     k_r = 0.15
-    omega_t, omega_c = 1.0/tau_t, 1.0/tau_c
-    
+    Q_m3s = args.flow_rate / 3.6e9                              # [m^3/s]
+    inject_radius_m = radius_vox * dx_m                         # [m]
+
+    # Physical simulation duration: use --t_phys if given, otherwise derive
+    # from --steps using the reference dt (tau_f=1.0 at the current nu_phys).
+    _nu_lb_ref = (1.0 - 0.5) / 3.0
+    _dt_ref    = (_nu_lb_ref * dx_m ** 2) / nu_phys
+    t_phys_total = args.t_phys if args.t_phys is not None else args.steps * _dt_ref
+
+    # ---- Geometry-Aware Circular Port Acoustic Scaling ----
+    mask_np_cropped = np.array(mask, dtype=bool)
+    scaler = CircularAcousticScaler(dx=dx_m, target_ulb_max=0.02)
+    dt_s, n_steps, tau_f_ref, tau_c, tau_t = scaler.recalibrate(
+        Q_ml_hr      = args.flow_rate,
+        geometry_array = mask_np_cropped,
+        inject_radius_m = inject_radius_m,
+        nu_phys      = nu_phys,
+        D_phys       = D_phys,
+        alpha_phys   = alpha_phys,
+        t_phys_total = t_phys_total,
+    )[:5]   # discard V_pore_max diagnostic return value
+
+    # Relaxation frequencies derived from recalibrated τ values
+    omega_t, omega_c = 1.0 / tau_t, 1.0 / tau_c
+
+    # ---------------------------------------------------------------
+    # Price–Davenport viscosity: unit-conversion and τ_f closure
+    # C_field stores g CuSO4 per 100 mL of water (g/100mL).
+    # The PD model requires elemental Cu in g/L → multiply by this factor.
+    # ---------------------------------------------------------------
+    _CUSO4_TO_CU_GL = 10.0 * (CuSO4ViscositySimulator.MW_CU / CuSO4ViscositySimulator.MW_CUSO4)
+    _cs2_val        = 1.0 / 3.0   # D3Q19 lattice speed-of-sound squared
+
+    @jit
+    def update_dynamic_relaxation_time(T_field_c, C_field_gL_Cu):
+        """
+        Spatially-varying τ_f field derived from the Price–Davenport model.
+
+        Parameters
+        ----------
+        T_field_c      : JAX array of local temperature [°C]
+        C_field_gL_Cu  : JAX array of elemental Cu concentration [g/L]
+
+        Returns
+        -------
+        tau_f_field : JAX array, same spatial shape.  Clamped to (0.5, 10]
+                      to guarantee LBM stability everywhere in the domain.
+        """
+        nu_cSt   = CuSO4ViscositySimulator.calculate_kinematic_viscosity_cSt(
+                       T_field_c, C_field_gL_Cu)
+        nu_m2s   = nu_cSt * 1e-6                           # cSt → m²/s
+        nu_LB    = nu_m2s * (dt_s / (dx_m ** 2))           # lattice units
+        tau_f_fld = (nu_LB / _cs2_val) + 0.5
+        # τ > 0.5 strictly required; cap at 10 to avoid stagnation artifacts
+        return jnp.clip(tau_f_fld, 0.5001, 10.0)
+
+    # Lattice inlet velocity is exactly target_ulb_max = 0.02 by construction
+    u_lb = scaler.target_ulb_max
     nu_lb = (tau_f_ref - 0.5) / 3.0
-    dt_s = (nu_lb * (dx_m ** 2)) / nu_phys 
-    
-    Q_m3s = args.flow_rate / 3.6e9  
-    cross_section_area_m2 = float(np.sum(circular_mask_np)) * (dx_m ** 2)
-    u_phys_inlet = Q_m3s / cross_section_area_m2 
-    u_lb = u_phys_inlet * (dt_s / dx_m)
-    # Cap lattice inlet velocity to 0.02 to stay in the low-Mach stable regime.
-    # Flow rates that would exceed this are physically represented at the capped speed;
-    # increase --steps proportionally to preserve the same physical duration.
-    U_LB_MAX = 0.02
-    if u_lb > U_LB_MAX:
-        print(f"  [Warning] u_lb={u_lb:.4f} exceeds stability limit {U_LB_MAX}. Capping to {U_LB_MAX}.")
-        print(f"  [Hint] Increase --steps by ~{u_lb/U_LB_MAX:.1f}x to maintain physical duration.")
-        u_lb = U_LB_MAX
 
     vol_scale_mm3 = dx_mm ** 3
-    k_scale_m2 = dx_m ** 2
-    k_scale_darcy = k_scale_m2 / 0.9869233e-12  
-    u_scale_mms = (dx_mm / dt_s)                
-    
-    print("\n--- Physical Scales Confirmed (MCMP PR-EOS Mode) ---")
-    print(f"  Voxel Size: {args.dx_um} um")
-    print(f"  Time Step (dt): {dt_s:.2e} s")
-    print(f"  Inlet Velocity (Target): {u_phys_inlet*1000:.2f} mm/s (LBM: {u_lb:.4f})")
+    k_scale_m2    = dx_m ** 2
+    k_scale_darcy = k_scale_m2 / 0.9869233e-12
+    u_scale_mms   = dx_mm / dt_s
+
+    # Back-calculate physical inlet velocity for diagnostics
+    u_phys_inlet = u_lb * dx_m / dt_s
+
+    print("--- Physical Scales Confirmed (MCMP PR-EOS Mode) ---")
+    print(f"  Voxel Size      : {args.dx_um} um")
+    print(f"  Acoustic dt     : {dt_s:.4e} s")
+    print(f"  Total LBM steps : {n_steps}  (physical time = {t_phys_total:.4e} s)")
+    print(f"  Inlet Velocity  : {u_phys_inlet*1000:.4f} mm/s  (u_lb = {u_lb:.4f})")
     print("----------------------------------------------------\n")
 
     # ---------------------------------------------------------
@@ -476,8 +616,19 @@ def run_simulation():
         f_post_tree = sim.collision(f_tree)
         f1_post, f2_post = f_post_tree
 
-        # Concentration BGK collision (T handled by Thermal class)
-        h_post = h - omega_c * (h - calc_equilibrium_single(C_curr, u_eq))
+        # Concentration BGK collision with Stokes-Einstein corrected diffusivity.
+        # The local kinematic viscosity (Price-Davenport) modulates D via:
+        #   D_local = D_phys * (nu_phys_ref / nu_phys_local)   [Stokes-Einstein]
+        # This yields a spatially-varying omega_c_field across the domain.
+        C_curr_gL_Cu  = C_curr * _CUSO4_TO_CU_GL
+        tau_f_field   = update_dynamic_relaxation_time(T_curr, C_curr_gL_Cu)
+        # Invert tau_f_field to recover local nu [m²/s] for SE correction
+        nu_local_m2s  = (tau_f_field - 0.5) * _cs2_val * (dx_m ** 2 / dt_s)
+        se_ratio      = nu_phys / jnp.maximum(nu_local_m2s, 1e-12)  # nu_ref / nu_local
+        D_local       = D_phys * se_ratio
+        tau_c_field   = jnp.clip(0.5 + D_local * (dt_s / (_cs2_val * dx_m ** 2)), 0.5001, 10.0)
+        omega_c_field = (1.0 / tau_c_field)[..., None]   # broadcast over velocity dim
+        h_post = h - omega_c_field * (h - calc_equilibrium_single(C_curr, u_eq))
 
         # 3. [PRECIPITATION KINETICS] — polynomial solubility against local T_curr
         effective_fluid_mask = mask & (solid_frac < 0.5)
@@ -568,28 +719,31 @@ def run_simulation():
         f_sum.write(f"Flow Axis          : {args.axis}\n")
         f_sum.write(f"Flow Rate          : {args.flow_rate} mL/hr\n")
         f_sum.write(f"Voxel Size (dx)    : {args.dx_um} um\n")
-        f_sum.write(f"Total LBM Steps    : {args.steps}\n")
+        f_sum.write(f"Total LBM Steps    : {n_steps}  (physical {t_phys_total:.4e} s)\n")
         f_sum.write(f"Injection Size     : {args.inject_size}^3\n\n")
         
-        f_sum.write("--- 2. Physical & LBM Scales ---\n")
+        f_sum.write("--- 2. Physical & LBM Scales (Acoustic Scaling) ---\n")
         f_sum.write(f"Domain Grid Size   : {mask.shape[0]} x {mask.shape[1]} x {mask.shape[2]}\n")
-        f_sum.write(f"Time Step (dt)     : {dt_s:.6e} s\n")
+        f_sum.write(f"Inject Radius      : {inject_radius_m * 1e3:.3f} mm\n")
+        f_sum.write(f"Acoustic dt        : {dt_s:.6e} s\n")
+        f_sum.write(f"Physical Duration  : {t_phys_total:.4e} s\n")
         f_sum.write(f"Physical Inlet Vel : {u_phys_inlet * 1000:.4f} mm/s\n")
-        f_sum.write(f"LBM Inlet Vel (u)  : {u_lb:.6f}\n")
-        f_sum.write(f"Kinematic Visc(nu) : {nu_phys:.2e} m^2/s\n\n")
-        
+        f_sum.write(f"LBM Inlet Vel (u)  : {u_lb:.6f}  (bounded = 0.02)\n")
+        f_sum.write(f"Kinematic Visc(nu) : {nu_phys:.2e} m^2/s\n")
+        f_sum.write(f"Solute Diff (D)    : {D_phys:.2e} m^2/s\n")
+        f_sum.write(f"Thermal Diff (a)   : {alpha_phys:.2e} m^2/s\n\n")
+
         f_sum.write("--- 3. Thermodynamics & Kinetics ---\n")
         f_sum.write(f"Inlet Temp (T_hot) : {75.0} C\n")
         f_sum.write(f"Wall Temp (T_cold) : {25.0} C\n")
-        # หากคุณมีตัวแปร eta_cht ในสคริปต์ ให้ใส่ด้วย
-        # f_sum.write(f"Heat Transfer (eta): {eta_cht}\n") 
+        f_sum.write(f"CHT eta            : 0.15\n")
         f_sum.write(f"Inlet Conc (C_in)  : 60.0 g/100mL\n")
         f_sum.write(f"Reaction Rate (k_r): {k_r}\n\n")
-        
-        f_sum.write("--- 4. LBM Relaxation Parameters ---\n")
-        f_sum.write(f"Fluid (tau_f_ref)  : {tau_f_ref}\n")
-        f_sum.write(f"Thermal (tau_t)    : {tau_t}\n")
-        f_sum.write(f"Solute (tau_c)     : {tau_c}\n")
+
+        f_sum.write("--- 4. Transport-Invariant Relaxation Parameters ---\n")
+        f_sum.write(f"Fluid  tau_f       : {tau_f_ref:.6f}  (nu_lb = {nu_lb:.6f})\n")
+        f_sum.write(f"Thermal tau_t      : {tau_t:.6f}\n")
+        f_sum.write(f"Solute  tau_c      : {tau_c:.6f}\n")
         f_sum.write("=================================================\n")
         
     print(f"\n[INFO] Simulation parameters saved to: {summary_path}\n")
@@ -604,7 +758,7 @@ def run_simulation():
     domain_length = float(args.inject_size)
     D_solute = (1.0/3.0) * (tau_c - 0.5)
 
-    print(f"Running Reactive MCMP (PR-EOS) + Thermal-class CHT, {args.steps} LBM steps...")
+    print(f"Running Reactive MCMP (PR-EOS) + Thermal-class CHT, {n_steps} LBM steps...")
     # State is now split: (f_tree, h, solid_frac) for MCMP+concentration
     # and `g` for temperature, driven by CuSO4_ThermalSolver each step.
     mask_cpu = np.array(mask)
@@ -665,8 +819,12 @@ def run_simulation():
             delta_P = P_in - P_out
             mean_u = np.mean(u_np[..., 0]) 
             
-            avg_T = np.mean(T_np)
-            tau_f_avg = float(calculate_tau_f(jnp.array(avg_T), tau_ref=tau_f_ref))
+            avg_T      = np.mean(T_np)
+            avg_C_gL_Cu = float(np.mean(C_np[fluid_mask_current])) * _CUSO4_TO_CU_GL if np.any(fluid_mask_current) else 0.0
+            # Price–Davenport: volume-averaged τ_f from local T and Cu concentration
+            tau_f_avg   = float(jnp.mean(
+                update_dynamic_relaxation_time(jnp.array(avg_T), jnp.array(avg_C_gL_Cu))
+            ))
             mu_fluid_avg = (tau_f_avg - 0.5) / 3.0
             
             k_raw = float(np.array(compute_permeability(mean_u, mu_fluid_avg, domain_length, delta_P)))
@@ -710,9 +868,9 @@ def run_simulation():
                 csv.writer(f_csv2).writerow([current_step, num_features, avg_size, max_size, surface_area])
                 csv.writer(f_csv3).writerow([current_step, min_throat, tortuosity])
 
-            print(f"Step {current_step}/{args.steps} | Time: {time_s:.2f} s | Porosity: {porosity:.4f} | Crystals: {num_features} | k: {k_perm_darcy:.2e} Darcy | Max Supersat: {max_supersat:.4f} | Crystal Vol: {current_solid_vol_mm3:.2e} mm3")
+            print(f"Step {current_step}/{n_steps} | Time: {time_s:.2f} s | Porosity: {porosity:.4f} | Crystals: {num_features} | k: {k_perm_darcy:.2e} Darcy | Max Supersat: {max_supersat:.4f} | Crystal Vol: {current_solid_vol_mm3:.2e} mm3")
 
-        if current_step >= args.steps:
+        if current_step >= n_steps:
             break
 
         # ---- Single LBM step ----
