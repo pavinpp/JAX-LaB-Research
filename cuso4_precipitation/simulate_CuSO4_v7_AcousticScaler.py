@@ -325,7 +325,7 @@ def run_simulation():
     args = parse_ui_args()
     
     print(f"Loading geometry and cropping to {args.inject_size}^3...")
-    mask_np_full = np.load(args.geom).astype(bool)
+    mask_np_full = ~np.load(args.geom).astype(bool)
     
     c_size = args.inject_size
     half_c = c_size // 2

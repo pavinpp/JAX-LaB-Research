@@ -184,7 +184,9 @@ class ReactiveMCMP_Simulator(MultiphaseMRT):
     def collision(self, fin_tree):
         fin_tree = jax_map(lambda f: self.precisionPolicy.cast_to_compute(f), fin_tree)
         rho_tree, u_tree = self.update_macroscopic(fin_tree)
-        rho_tree = jax_map(lambda rho: jnp.maximum(rho, 1e-8), rho_tree)
+        # ป้องกันไม่ให้ความหนาแน่นต่ำกว่า 1e-4 เด็ดขาด 
+        # เพื่อให้มีมวลหล่อลื่นเหลืออยู่เสมอ ป้องกันการหารศูนย์
+        rho_tree = jax_map(lambda rho: jnp.maximum(rho, 1e-4), rho_tree)
         u_tree = jax_map(lambda u: jnp.nan_to_num(jnp.clip(u, -0.2, 0.2), nan=0.0, posinf=0.2, neginf=-0.2), u_tree)
 
         m_tree = jax_map(lambda f, M: jnp.dot(f, M), fin_tree, self.M)
@@ -308,12 +310,15 @@ class CuSO4_ThermalSolver(ThermalBGK):
             ))
 
             # ---- 3. Outlet (x=-1) — zero-gradient / do-nothing ----
-            outlet_idx = (np.full(n_in, self.nx - 1, dtype=int), iy, iz)
-            self.thermal_BCs.append(DoNothing(
-                indices=outlet_idx,
-                gridInfo=self.gridInfo,
-                precision_policy=self.precisionPolicy,
-            ))
+            oy, oz = np.where(self.pore_mask_np[-1])
+            n_out = len(oy)
+            if n_out > 0:
+                outlet_idx = (np.full(n_out, self.nx - 1, dtype=int), oy, oz)
+                self.thermal_BCs.append(DoNothing(
+                    indices=outlet_idx,
+                    gridInfo=self.gridInfo,
+                    precision_policy=self.precisionPolicy,
+                ))
 
 
 # =========================================================================
@@ -452,8 +457,8 @@ def run_simulation():
     
     # 2. ปฏิสัมพันธ์ Shan-Chen
     g_kkprime_val = jnp.array([
-        [0.0, 0.57], 
-        [0.57, 0.0]
+        [0.0, 0.15], 
+        [0.15, 0.0]
     ], dtype=jnp.float64)
 
     # 3. MRT transform matrix for D3Q19
@@ -529,8 +534,10 @@ def run_simulation():
     T_hot, T_cold = 75.0, 25.0
     C_inlet = 60.0  # 60 g/100 mL H2O — undersaturated at 75°C (solubility ~83.8 g/100mL)
     
-    rho1 = jnp.full(mask.shape, 1e-4, dtype=jnp.float64)
-    rho2 = jnp.ones(mask.shape, dtype=jnp.float64) * 0.5 # Native Air
+    # Phase 1: Residual Solution 
+    rho1 = jnp.where(mask, 0.05, 0.0).astype(jnp.float64) 
+    # Phase 2: Bulk Air
+    rho2 = jnp.where(mask, 0.50, 0.0).astype(jnp.float64) 
     u_init = jnp.zeros(mask.shape + (3,), dtype=jnp.float64)
     
     f1 = sim.equilibrium(rho1[..., None], u_init).astype(jnp.float64)
@@ -607,7 +614,7 @@ def run_simulation():
         # 1. Update Macroscopic ของไหล
         rho_tree, _ = sim.update_macroscopic(f_tree)
         u_eq = sim.macroscopic_velocity(f_tree, rho_tree)
-        u_eq = jnp.nan_to_num(u_eq, nan=0.0, posinf=0.1, neginf=-0.1)
+        u_eq = jnp.nan_to_num(u_eq, nan=0.0, posinf=0.1, neginf=0.1)
         rho1, rho2 = rho_tree
 
         C_curr = jnp.nan_to_num(jnp.sum(h, axis=-1), nan=0.0, posinf=2.0, neginf=0.0)
@@ -673,19 +680,22 @@ def run_simulation():
         #    Thermal inlet/outlet are handled by CuSO4_ThermalSolver (EquilibriumBC / DoNothing).
         ramp_factor = jnp.clip(step_idx / 500.0, 0.0, 1.0)
         current_u_lb = u_lb * ramp_factor
+        inlet_open_pores = circular_mask & mask[0]
         if args.axis == 'X':
             u_in     = jnp.zeros_like(u_eq[0]).at[..., 0].set(current_u_lb)
-            f1_eq_in = calc_equilibrium_single(jnp.ones_like(rho1[0, ..., 0]), u_in)
-            f2_eq_in = calc_equilibrium_single(jnp.zeros_like(rho2[0, ..., 0]), u_in)
+            # Inject Bulk Solution (Component 1) and Residual Air (Component 2)
+            f1_eq_in = calc_equilibrium_single(jnp.full_like(rho1[0, ..., 0], 0.50), u_in) 
+            f2_eq_in = calc_equilibrium_single(jnp.full_like(rho2[0, ..., 0], 0.05), u_in) 
             h_eq_in  = calc_equilibrium_single(jnp.ones_like(C_curr[0]) * C_inlet, u_in)
 
-            f1_str = f1_str.at[0].set(jnp.where(circular_mask[..., None], f1_eq_in, f1_str[0]))
-            f2_str = f2_str.at[0].set(jnp.where(circular_mask[..., None], f2_eq_in, f2_str[0]))
-            h_str  = h_str.at[0].set( jnp.where(circular_mask[..., None], h_eq_in,  h_str[0]))
+            f1_str = f1_str.at[0].set(jnp.where(inlet_open_pores[..., None], f1_eq_in, f1_str[0]))
+            f2_str = f2_str.at[0].set(jnp.where(inlet_open_pores[..., None], f2_eq_in, f2_str[0]))
+            h_str  = h_str.at[0].set( jnp.where(inlet_open_pores[..., None], h_eq_in,  h_str[0]))
 
-            f1_str = f1_str.at[-1].set(jnp.where(circular_mask[..., None], f1_str[-2], f1_str[-1]))
-            f2_str = f2_str.at[-1].set(jnp.where(circular_mask[..., None], f2_str[-2], f2_str[-1]))
-            h_str  = h_str.at[-1].set( jnp.where(circular_mask[..., None], h_str[-2],  h_str[-1]))
+            outlet_open_pores = mask[-1]
+            f1_str = f1_str.at[-1].set(jnp.where(outlet_open_pores[..., None], f1_str[-2], f1_str[-1]))
+            f2_str = f2_str.at[-1].set(jnp.where(outlet_open_pores[..., None], f2_str[-2], f2_str[-1]))
+            h_str  = h_str.at[-1].set( jnp.where(outlet_open_pores[..., None], h_str[-2],  h_str[-1]))
 
         f1_str    = jnp.nan_to_num(f1_str,   nan=0.0, posinf=1e6,  neginf=-1e6)
         f2_str    = jnp.nan_to_num(f2_str,   nan=0.0, posinf=1e6,  neginf=-1e6)
